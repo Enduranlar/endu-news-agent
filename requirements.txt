@@ -1,0 +1,8 @@
+# Endurance Sports Nutrition News Agent — runtime dependencies
+# Pin to compatible minor ranges; keep the set minimal.
+anthropic>=0.69,<1.0
+httpx[socks]>=0.27,<0.29   # [socks] pulls in socksio for SOCKS5 proxy support
+feedparser>=6.0,<7.0
+trafilatura>=1.12,<3.0
+python-dotenv>=1.0,<2.0
+PyYAML>=6.0,<7.0

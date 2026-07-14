@@ -1,0 +1,29 @@
+# Secrets
+.env
+
+# Live operator config — your real curated sources + business context. The repo
+# ships *.example templates instead; copy them to these names (or keep the real
+# files in AGENT_STATE_DIR). This keeps private data out of a public repo.
+config/igaccounts.md
+config/websites.md
+config/interests.yaml
+
+# State + logs
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+logs/*.log
+logs/*.log.*
+
+# Reports archive (operator choice — keep tracked if you want history in git).
+# Commented out by default so reports/index.* and dated reports persist.
+# reports/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/

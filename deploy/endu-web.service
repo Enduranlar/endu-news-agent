@@ -1,0 +1,30 @@
+# systemd unit for the Endu news-agent web admin UI.
+#
+# Install (adjust WorkingDirectory / ExecStart to where you cloned the repo):
+#   sudo cp deploy/endu-web.service /etc/systemd/system/endu-web.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now endu-web.service
+#   systemctl status endu-web.service
+#   journalctl -u endu-web.service -f      # live logs
+#
+# Set WEB_LISTEN_HOST (your VPS Tailscale IP) and WEB_LISTEN_PORT in .env.
+# Restart after editing .env:  sudo systemctl restart endu-web.service
+#
+# The app binds to a specific (Tailscale) IP which may not exist yet at boot, so
+# Restart=always + RestartSec makes systemd retry until the address is available.
+
+[Unit]
+Description=Endu news agent — web admin UI
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=ps
+WorkingDirectory=/home/ps/endu-news-agent
+ExecStart=/home/ps/endu-news-agent/.venv/bin/python -m src.main web
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
