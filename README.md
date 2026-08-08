@@ -253,6 +253,30 @@ deleted).
 
 ---
 
+## De-duplication of repeated stories
+
+The same story often arrives from several sources (different IG accounts / sites)
+and survives exact dedup (post_id / URL hash). Each report build runs a **report-wide**
+LLM pass that clusters items describing the same event **across all categories** and
+keeps the single best one (highest importance → most recent), so new reports don't
+repeat lines. Any LLM hiccup falls back to keeping everything.
+
+To clean **already-archived** reports the same way (they're rendered Markdown, so
+the build-time pass never saw them):
+
+```bash
+python scripts/dedupe_reports.py --dry-run    # preview across all archived reports
+python scripts/dedupe_reports.py              # rewrite them in place
+python scripts/dedupe_reports.py 2026/2026-07-01_friday.md   # a specific file
+```
+
+It only touches category item bullets (the intro, upcoming-races and suggestions
+sections are left alone), drops any category section left empty, and updates
+`reports/index.json` / `index.md` counts. Reports live under `AGENT_STATE_DIR` (if
+set), so review the diff and commit with `scripts/sync_state.py` afterwards.
+
+---
+
 ## Resetting local state
 
 To wipe the database, logs, and archived reports (e.g. to start fresh) without
@@ -423,6 +447,7 @@ nutrition-news-agent/
 ├── scripts/
 │   ├── add_website.py       # standalone: detect feed + add a site to websites.md
 │   ├── sync_state.py        # commit + push the state repo (AGENT_STATE_DIR)
+│   ├── dedupe_reports.py    # retroactively de-duplicate archived reports
 │   └── reset.py             # erase db + logs + reports (asks to confirm)
 ├── data/agent.db            # SQLite (gitignored)
 ├── reports/                 # archived reports + index.md / index.json

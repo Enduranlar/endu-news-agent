@@ -149,33 +149,33 @@ def build_report(
     return bundle
 
 
-def _dedupe_report_items(
-    items: list[ReportItem], llm: LLMClient
-) -> tuple[list[ReportItem], int]:
-    """Drop items that duplicate the same story, report-wide.
+def duplicate_drop_indices(entries: list[dict], llm: LLMClient) -> set[int]:
+    """Return the set of entry indices to drop as duplicates, report-wide.
 
-    Asks the LLM to cluster items describing the same underlying event (across all
-    categories), merges overlapping clusters, and keeps the single best item per
-    cluster — highest importance, then most recent, then earliest listed. On any
-    LLM failure it returns the items unchanged (never fails a report)."""
-    if len(items) < 2:
-        return items, 0
+    `entries` is a list of dicts with keys: category, source, one_line, importance,
+    date. Asks the LLM to cluster entries describing the same underlying event
+    (across all categories), merges overlapping/chained clusters (union-find), and
+    keeps the single best per cluster — highest importance, then most recent, then
+    earliest listed. Returns an empty set on any LLM failure (never raises). Shared
+    by live report building and offline report reprocessing."""
+    n = len(entries)
+    if n < 2:
+        return set()
 
     payload = [
         {
             "index": i,
-            "category": it.category,
-            "source": it.source,
-            "one_line": it.one_line,
+            "category": e.get("category", ""),
+            "source": e.get("source", ""),
+            "one_line": e.get("one_line", ""),
         }
-        for i, it in enumerate(items)
+        for i, e in enumerate(entries)
     ]
     groups = llm.find_duplicate_groups(payload)
     if not groups:
-        return items, 0
+        return set()
 
-    # Union-find over indices so overlapping/chained groups merge into clusters.
-    parent = list(range(len(items)))
+    parent = list(range(n))
 
     def find(x: int) -> int:
         while parent[x] != x:
@@ -184,14 +184,14 @@ def _dedupe_report_items(
         return x
 
     for g in groups:
-        idxs = [i for i in g if isinstance(i, int) and 0 <= i < len(items)]
+        idxs = [i for i in g if isinstance(i, int) and 0 <= i < n]
         for j in idxs[1:]:
             ra, rb = find(idxs[0]), find(j)
             if ra != rb:
                 parent[ra] = rb
 
     clusters: dict[int, list[int]] = {}
-    for i in range(len(items)):
+    for i in range(n):
         clusters.setdefault(find(i), []).append(i)
 
     drop: set[int] = set()
@@ -200,10 +200,34 @@ def _dedupe_report_items(
             continue
         keep = max(
             members,
-            key=lambda i: (items[i].importance, items[i].date or "", -i),
+            key=lambda i: (
+                entries[i].get("importance", 1),
+                entries[i].get("date", "") or "",
+                -i,
+            ),
         )
         drop.update(m for m in members if m != keep)
+    return drop
 
+
+def _dedupe_report_items(
+    items: list[ReportItem], llm: LLMClient
+) -> tuple[list[ReportItem], int]:
+    """Drop ReportItems that duplicate the same story, report-wide (see
+    duplicate_drop_indices). Returns (kept_items, removed_count)."""
+    if len(items) < 2:
+        return items, 0
+    entries = [
+        {
+            "category": it.category,
+            "source": it.source,
+            "one_line": it.one_line,
+            "importance": it.importance,
+            "date": it.date,
+        }
+        for it in items
+    ]
+    drop = duplicate_drop_indices(entries, llm)
     if not drop:
         return items, 0
     kept = [it for k, it in enumerate(items) if k not in drop]
