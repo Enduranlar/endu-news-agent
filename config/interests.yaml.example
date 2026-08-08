@@ -1,0 +1,49 @@
+# The interest list — this drives what the agent keeps and how it groups it.
+#
+# The relevance prompt reads this file, so you tune scope (categories + business
+# context) by editing config, not code.
+#
+# SETUP: copy this file to `interests.yaml` and edit it for your business (or put
+# your real interests.yaml in $AGENT_STATE_DIR/config/ if you keep state separate):
+#
+#   cp config/interests.yaml.example config/interests.yaml
+#
+# Rules:
+#   - `id` values are STABLE keys stored in the DB — don't rename them; edit the
+#     `label` text and `context` freely.
+#   - `label` is what appears as a section heading in the report.
+#   - `label` and `context` may be in ANY language — they are fed to the LLM and
+#     shape both categorization and the report wording.
+#   - Note: the shipped report chrome and LLM prompts are currently in Turkish
+#     (this started as a Turkish project). To run fully in another language, also
+#     translate the fixed strings in src/report.py and the prompts in src/llm.py.
+
+categories:
+  - id: upcoming_races_tr
+    label: "Upcoming races (your region)"
+  - id: upcoming_races_global
+    label: "Upcoming big races (global)"
+  - id: account_news
+    label: "Followed accounts — projects / announcements / news"
+  - id: records
+    label: "Broken records"
+  - id: race_results
+    label: "Race results — top finishers"
+  - id: incidents
+    label: "Accidents / safety incidents in sport"
+  - id: major_news
+    label: "Major sports news"
+  - id: competitors
+    label: "Competitor news: product launches, discounts, etc."
+
+# Describe your business and what to prioritize (and what to skip). The more
+# specific this is, the better the filtering. Example:
+context: >
+  We sell endurance sports nutrition (energy gels, electrolyte and recovery
+  powders) for running, trail, ultra, triathlon and cycling, to a regional and
+  global audience. Prioritize endurance disciplines and anything touching athlete
+  nutrition, fueling, hydration, and product launches — from us and from
+  competitors. We use this both to build a customer newsletter and to inform our
+  own strategy. Don't repeat the same story more than once. Skip routine
+  "registration still open" reminders on race Instagram pages; only tell me when a
+  race's registration opens for the first time.

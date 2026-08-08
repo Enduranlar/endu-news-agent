@@ -1,0 +1,23 @@
+# Tracked websites
+#
+# One source per line: `<type> | <url>` with an optional `| note` at the end.
+#   type = rss   → an RSS/Atom feed URL (preferred; cheap + reliable)
+#   type = site  → a homepage/listing page the agent crawls for new article links
+# Blank lines and `#` comments are ignored.
+#
+# SETUP: copy this file to `websites.md` and replace the entries below (or put your
+# real websites.md in $AGENT_STATE_DIR/config/ if you keep state in a separate repo):
+#
+#   cp config/websites.md.example config/websites.md
+#
+# TIP: `python -m src.main add-site <url>` visits a site, auto-detects its RSS feed
+# (falling back to `site` if none), and appends the right line here for you.
+
+# RSS feeds (preferred)
+rss  | https://www.letsrun.com/feed/
+rss  | https://www.outsideonline.com/rss/
+
+# Raw sites (no RSS; the agent crawls the homepage/listing for new article links,
+# capped per run and rate-limited). Route region-specific sites through a proxy if
+# they geo-block datacenter IPs — see OUTBOUND_PROXY_URL in .env.
+site | https://www.example-athletics.org/news
