@@ -4,8 +4,8 @@ Pulls relevant items ingested since the last sent report, groups them by interes
 category (interests.yaml order), sorts by importance then recency, and asks the
 summary model to write a 2–3 sentence "what matters this week" intro. Per-category
 bullets are rendered deterministically from the stored one_line + link + date so
-links are never hallucinated. A pending-suggestions section is appended for
-operator approval.
+links are never hallucinated. (Source suggestions are reviewed in the web admin
+UI, not the report.)
 """
 
 from __future__ import annotations
@@ -46,7 +46,6 @@ class ReportBundle:
     date_str: str
     intro: str
     groups: list[tuple[str, list[ReportItem]]]  # (category label, items)
-    suggestions: list[dict]
     upcoming_races: list[dict]
     item_count: int
     categories_covered: list[str] = field(default_factory=list)
@@ -112,8 +111,6 @@ def build_report(
         groups.append((cat.label, bucket))
         covered.append(cat.id)
 
-    suggestions = [dict(s) for s in store.pending_suggestions()]
-
     now = istanbul_now()
     today = now.date()
     horizon = today + timedelta(days=REPORT_UPCOMING_DAYS)
@@ -139,7 +136,6 @@ def build_report(
         date_str=date_str,
         intro=intro,
         groups=groups,
-        suggestions=suggestions,
         upcoming_races=upcoming_races,
         item_count=len(items),
         categories_covered=covered,
@@ -306,20 +302,6 @@ def _render_markdown(b: ReportBundle) -> str:
             out.append(f"- **{r['date_raw']}** {r['name']}{loc}{dist}{link}")
         out.append("")
 
-    out.append("## Önerilen yeni kaynaklar (onayınızı bekliyor)")
-    out.append("")
-    if not b.suggestions:
-        out.append("_Bekleyen öneri yok._")
-    else:
-        for s in b.suggestions:
-            label = f"@{s['key']}" if s["kind"] == "ig" else s["key"]
-            out.append(
-                f"- **{label}** ({s['kind']}) — {s['reason']} "
-                f"_[{s['signal']}; via {s['discovered_via']}]_  "
-                f"`approve --{'ig' if s['kind']=='ig' else 'site'} "
-                f"{s['key']}` / `dismiss --id {s['id']}`"
-            )
-    out.append("")
     return "\n".join(out)
 
 
@@ -390,27 +372,6 @@ def _render_html(b: ReportBundle) -> str:
             body.append(
                 '<li style="font-size:14px;line-height:1.5;margin-bottom:6px;color:#222;">'
                 f'<strong>{_esc(r["date_raw"])}</strong> {name}{loc}{dist}</li>'
-            )
-        body.append("</ul>")
-
-    body.append(
-        '<h2 style="font-size:15px;color:#a60;border-bottom:1px solid #eee;'
-        'padding-bottom:4px;margin-top:24px;">Önerilen yeni kaynaklar '
-        "(onayınızı bekliyor)</h2>"
-    )
-    if not b.suggestions:
-        body.append('<p style="color:#777;font-style:italic;">Bekleyen öneri yok.</p>')
-    else:
-        body.append('<ul style="padding-left:18px;margin:8px 0;">')
-        for s in b.suggestions:
-            label = f"@{s['key']}" if s["kind"] == "ig" else s["key"]
-            body.append(
-                f'<li style="font-size:14px;line-height:1.5;margin-bottom:6px;color:#222;">'
-                f"<strong>{_esc(label)}</strong> "
-                f'<span style="color:#999;">({_esc(s["kind"])})</span> &mdash; '
-                f'{_esc(s["reason"])} '
-                f'<span style="color:#999;font-size:12px;">[{_esc(s["signal"])}; '
-                f'via {_esc(s["discovered_via"])}]</span></li>'
             )
         body.append("</ul>")
 
