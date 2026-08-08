@@ -1,0 +1,25 @@
+# Followed Instagram accounts
+#
+# One handle per line. Optional inline note after `|`. Blank lines and lines
+# starting with `#` are ignored, so use them to group/annotate.
+#
+# SETUP: copy this file to `igaccounts.md` and replace the entries below with the
+# accounts you want to follow (or, if you keep state in a separate repo, put your
+# real igaccounts.md in $AGENT_STATE_DIR/config/).
+#
+#   cp config/igaccounts.md.example config/igaccounts.md
+#
+# The agent detects new posts on each account, filters them for relevance, and
+# proposes related accounts as suggestions you approve. Approved handles are
+# appended here automatically by `approve --ig` or the web admin UI.
+
+# brands
+maurten_official | gels / endurance nutrition (global)
+scienceinsport   | gels / endurance nutrition (global)
+
+# organizations / races
+utmbmontblanc    | trail running (global)
+wser             | Western States 100 (global)
+
+# news
+trailrunningmag  | trail running news (global)
