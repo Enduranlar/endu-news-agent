@@ -93,6 +93,14 @@ def build_report(
             )
         )
 
+    # Report-wide de-duplication: the same story often arrives from several
+    # sources (different IG accounts / sites) and survives exact dedup, so an LLM
+    # pass clusters items describing the SAME event across ALL categories and we
+    # keep the single best one per cluster.
+    items, removed = _dedupe_report_items(items, llm)
+    if removed:
+        log.info("report dedup: removed %d duplicate item(s)", removed)
+
     # Group by interest-list category order; sort within by importance then recency.
     groups: list[tuple[str, list[ReportItem]]] = []
     covered: list[str] = []
@@ -139,6 +147,67 @@ def build_report(
     bundle.markdown = _render_markdown(bundle)
     bundle.html = _render_html(bundle)
     return bundle
+
+
+def _dedupe_report_items(
+    items: list[ReportItem], llm: LLMClient
+) -> tuple[list[ReportItem], int]:
+    """Drop items that duplicate the same story, report-wide.
+
+    Asks the LLM to cluster items describing the same underlying event (across all
+    categories), merges overlapping clusters, and keeps the single best item per
+    cluster — highest importance, then most recent, then earliest listed. On any
+    LLM failure it returns the items unchanged (never fails a report)."""
+    if len(items) < 2:
+        return items, 0
+
+    payload = [
+        {
+            "index": i,
+            "category": it.category,
+            "source": it.source,
+            "one_line": it.one_line,
+        }
+        for i, it in enumerate(items)
+    ]
+    groups = llm.find_duplicate_groups(payload)
+    if not groups:
+        return items, 0
+
+    # Union-find over indices so overlapping/chained groups merge into clusters.
+    parent = list(range(len(items)))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for g in groups:
+        idxs = [i for i in g if isinstance(i, int) and 0 <= i < len(items)]
+        for j in idxs[1:]:
+            ra, rb = find(idxs[0]), find(j)
+            if ra != rb:
+                parent[ra] = rb
+
+    clusters: dict[int, list[int]] = {}
+    for i in range(len(items)):
+        clusters.setdefault(find(i), []).append(i)
+
+    drop: set[int] = set()
+    for members in clusters.values():
+        if len(members) < 2:
+            continue
+        keep = max(
+            members,
+            key=lambda i: (items[i].importance, items[i].date or "", -i),
+        )
+        drop.update(m for m in members if m != keep)
+
+    if not drop:
+        return items, 0
+    kept = [it for k, it in enumerate(items) if k not in drop]
+    return kept, len(drop)
 
 
 def _write_intro(

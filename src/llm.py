@@ -100,6 +100,25 @@ _RESULTS_SCHEMA: dict[str, Any] = {
     "required": ["found", "summary"],
 }
 
+_DEDUPE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "groups": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "indices": {"type": "array", "items": {"type": "integer"}}
+                },
+                "required": ["indices"],
+            },
+        }
+    },
+    "required": ["groups"],
+}
+
 
 class LLMClient:
     def __init__(self, api_key: str, filter_model: str, summary_model: str):
@@ -238,6 +257,60 @@ class LLMClient:
         except Exception as exc:  # noqa: BLE001
             log.warning("vet_source failed (%s); skipping candidate", exc)
             return None
+
+    # --- Report-wide de-duplication ------------------------------------
+
+    def find_duplicate_groups(
+        self, items: list[dict[str, Any]]
+    ) -> list[list[int]]:
+        """Cluster report items that describe the SAME story/event.
+
+        `items` is a list of dicts with: index, category, source, one_line.
+        Returns a list of groups, each a list of item indices that are duplicates
+        of one another (only groups of 2+). Returns [] on any failure so the report
+        never fails over dedup."""
+        if len(items) < 2:
+            return []
+        lines = "\n".join(
+            f"[{it['index']}] (kategori: {it.get('category','')} | "
+            f"kaynak: {it.get('source','')}) {it.get('one_line','')}"
+            for it in items
+        )
+        prompt = (
+            "Aşağıda bir haber raporundaki maddeler numaralandırılmış olarak var "
+            "(kategori ve kaynak dahil). Bazı maddeler AYNI haberi/olayı farklı "
+            "kaynaklardan tekrar ediyor olabilir. Aynı haberi/olayı anlatan madde "
+            "gruplarını bul ve her grubun index'lerini döndür.\n\n"
+            "Kurallar:\n"
+            "- Sadece GERÇEKTEN aynı olayı/haberi anlatan maddeleri grupla (ör. "
+            "aynı yarış sonucu, aynı rekor, aynı ürün lansmanı farklı kaynaklardan).\n"
+            "- Sadece benzer konu ya da aynı yarış ama FARKLI bilgi içeren "
+            "maddeleri gruplama.\n"
+            "- Kategoriler farklı olsa bile aynı haberi anlatan maddeleri "
+            "gruplayabilirsin (rapor genelinde çalış).\n"
+            "- Tek maddelik grup döndürme; sadece 2+ maddelik gerçek tekrarları döndür.\n\n"
+            f"MADDELER:\n{lines}\n\n"
+            "Tekrar eden madde gruplarının index listelerini döndür."
+        )
+        try:
+            resp = self.client.messages.create(
+                model=self.filter_model,
+                max_tokens=1500,
+                messages=[{"role": "user", "content": prompt}],
+                output_config={
+                    "format": {"type": "json_schema", "schema": _DEDUPE_SCHEMA}
+                },
+            )
+            data = self._extract_json(resp)
+            out: list[list[int]] = []
+            for g in data.get("groups", []):
+                idxs = [int(i) for i in g.get("indices", []) if isinstance(i, int)]
+                if len(idxs) >= 2:
+                    out.append(idxs)
+            return out
+        except Exception as exc:  # noqa: BLE001 — never fail a report over dedup
+            log.warning("find_duplicate_groups failed (%s); keeping all items", exc)
+            return []
 
     # --- Race results extraction ---------------------------------------
 
