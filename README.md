@@ -76,6 +76,7 @@ $EDITOR .env          # fill in API keys, SMTP, proxy, REPORT_TO
 cp config/igaccounts.md.example  config/igaccounts.md
 cp config/websites.md.example    config/websites.md
 cp config/interests.yaml.example config/interests.yaml
+cp config/memory.yaml.example    config/memory.yaml       # optional (see Memory)
 $EDITOR config/igaccounts.md     # one IG handle per line
 $EDITOR config/websites.md       # rss|<url> or site|<url> per line
 $EDITOR config/interests.yaml    # categories + business context (tunes the LLM)
@@ -133,6 +134,7 @@ send.
 | `approve --site <url> [--as rss\|site]` | Approve a website → append to `config/websites.md`. |
 | `dismiss --id <n>` | Dismiss a suggestion; it never resurfaces. |
 | `status` | Last-run times, today's credit spend, DB counts. |
+| `memory [--topic X] [--query Q] [--forget ID] [--purge-expired]` | Inspect / prune what the agent remembers. |
 | `test-races [--all] [--limit N]` | Fetch + parse the teamrunbo race calendar (no DB writes). |
 | `test-sociavault --handle <h>` | Live profile call (field-path check). |
 
@@ -250,6 +252,57 @@ python -m src.main dismiss --id 42                # never resurfaced
 Approved sources start being tracked on the next `daily` run (sources reconcile
 from the config files into the DB each run; removed lines are marked inactive, not
 deleted).
+
+---
+
+## Memory (don't repeat the same story every report)
+
+De-duplication above works **within** one report. Memory works **across** reports:
+without it, a recurring story ("X yarışının kayıtları açık") is a brand-new item
+every time it's posted, so it lands in report after report.
+
+Enable it by creating `config/memory.yaml` (copy the `.example`). It's a policy
+file like `interests.yaml` — you list the kinds of facts worth remembering:
+
+```yaml
+topics:
+  - id: registration_open
+    label: "Yarış kayıtlarının açılması"
+    description: >
+      Bir yarışın kayıtlarının açıldığı duyurusu. Konu (subject) yarışın tam adıdır.
+    suppress_repeats: true      # later posts about the same subject are dropped
+    ttl_days: 365               # how long the memory stays in effect
+settings:
+  max_entries_in_prompt: 8
+```
+
+How it works:
+
+1. While scoring, the model records a fact as `(topic, subject)` — e.g.
+   `registration_open` / *Kanyon Ulubey Ultra Trail* — with a one-line summary.
+2. Later items about the **same subject and topic** are flagged as repeats and
+   stored `relevant=0`, so they never reach a report. A genuinely new development
+   about that subject (registration opened → race finished) still gets through.
+3. Entries expire after `ttl_days` and are purged on each `daily` run.
+
+**Context stays small — it never loads the whole memory.** Each entry is indexed
+by its subject's tokens; before scoring a batch the agent looks up only the entries
+whose tokens actually appear in those items, capped at `max_entries_in_prompt`.
+Typical cost is a few short lines, often zero — and it doesn't grow as memory does.
+Memory extraction rides along in the existing scoring call, so there are **no extra
+LLM round trips**.
+
+Inspect or correct it:
+
+```bash
+python -m src.main memory                     # list what it remembers
+python -m src.main memory --query kanyon      # search
+python -m src.main memory --forget 12         # drop one entry (it can be learned again)
+python -m src.main memory --purge-expired
+```
+
+Delete `config/memory.yaml` (or leave `topics` empty) to disable memory entirely —
+the pipeline then behaves exactly as before.
 
 ---
 
@@ -430,7 +483,8 @@ nutrition-news-agent/
 ├── config/                  # *.example templates are tracked; live files gitignored
 │   ├── igaccounts.md.example    # → copy to igaccounts.md (operator-curated IG handles)
 │   ├── websites.md.example      # → copy to websites.md   (sites + RSS)
-│   └── interests.yaml.example   # → copy to interests.yaml (categories + business context)
+│   ├── interests.yaml.example   # → copy to interests.yaml (categories + business context)
+│   └── memory.yaml.example      # → copy to memory.yaml (what to remember; optional)
 ├── src/
 │   ├── main.py              # CLI: daily, report, discover, approve, ...
 │   ├── settings.py          # env loading + validation

@@ -18,7 +18,7 @@ from typing import Any, Optional
 
 import anthropic
 
-from .config_loader import Interests
+from .config_loader import Interests, MemoryConfig
 
 log = logging.getLogger("agent.llm")
 
@@ -33,6 +33,10 @@ class ScoreResult:
     category: Optional[str]
     importance: int
     one_line: str
+    # Memory fields (populated only when memory is enabled in config/memory.yaml).
+    repeat: bool = False           # already reported — suppress
+    memory_topic: str = ""         # topic id to remember this under ("" = nothing)
+    memory_subject: str = ""       # subject the fact is about
 
 
 @dataclass
@@ -48,7 +52,24 @@ class RaceResultsExtract:
     summary: str  # Turkish, <=140 chars, naming top finishers if present
 
 
-def _score_schema(category_ids: list[str]) -> dict[str, Any]:
+def _score_schema(
+    category_ids: list[str], memory_topic_ids: Optional[list[str]] = None
+) -> dict[str, Any]:
+    """Scoring schema. When memory is enabled, each result also carries the
+    repeat flag and the memory topic/subject to record."""
+    props: dict[str, Any] = {
+        "index": {"type": "integer"},
+        "relevant": {"type": "boolean"},
+        "category": {"type": "string", "enum": category_ids},
+        "importance": {"type": "integer", "enum": [1, 2, 3, 4, 5]},
+        "one_line": {"type": "string"},
+    }
+    required = ["index", "relevant", "category", "importance", "one_line"]
+    if memory_topic_ids:
+        props["repeat"] = {"type": "boolean"}
+        props["memory_topic"] = {"type": "string", "enum": [*memory_topic_ids, ""]}
+        props["memory_subject"] = {"type": "string"}
+        required += ["repeat", "memory_topic", "memory_subject"]
     return {
         "type": "object",
         "additionalProperties": False,
@@ -58,20 +79,8 @@ def _score_schema(category_ids: list[str]) -> dict[str, Any]:
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
-                    "properties": {
-                        "index": {"type": "integer"},
-                        "relevant": {"type": "boolean"},
-                        "category": {"type": "string", "enum": category_ids},
-                        "importance": {"type": "integer", "enum": [1, 2, 3, 4, 5]},
-                        "one_line": {"type": "string"},
-                    },
-                    "required": [
-                        "index",
-                        "relevant",
-                        "category",
-                        "importance",
-                        "one_line",
-                    ],
+                    "properties": props,
+                    "required": required,
                 },
             }
         },
@@ -130,7 +139,11 @@ class LLMClient:
     # --- Relevance scoring ---------------------------------------------
 
     def score_items(
-        self, items: list[dict[str, str]], interests: Interests
+        self,
+        items: list[dict[str, str]],
+        interests: Interests,
+        memory: Optional["MemoryConfig"] = None,
+        recalled: Optional[list[dict[str, str]]] = None,
     ) -> list[ScoreResult]:
         """Score a batch of items for relevance + category.
 
@@ -138,11 +151,18 @@ class LLMClient:
         Returns results aligned by position to `items`. On a hard failure the
         whole batch is treated as not-relevant (logged), so a flaky call never
         crashes a run.
+
+        When `memory` is enabled, `recalled` carries only the memory entries that
+        the index matched for this batch (topic/subject/fact/date). The model uses
+        them to flag repeats and to say what new facts should be remembered.
         """
         if not items:
             return []
 
-        schema = _score_schema(interests.category_ids)
+        mem_on = bool(memory and memory.enabled)
+        schema = _score_schema(
+            interests.category_ids, memory.topic_ids if mem_on else None
+        )
         cat_lines = "\n".join(
             f"  - {c.id}: {c.label}" for c in interests.categories
         )
@@ -169,6 +189,7 @@ class LLMClient:
             "motivasyon paylaşımları ve konu dışı her şey için relevant=false "
             "işaretle. Kaynak içeriği İngilizce olsa bile one_line alanını "
             "TÜRKÇE yaz.\n\n"
+            f"{self._memory_block(memory, recalled) if mem_on else ''}"
             "ÖĞELER:\n"
             f"{items_block}\n\n"
             "Her öğe için aynı index ile bir sonuç nesnesi döndür."
@@ -190,6 +211,46 @@ class LLMClient:
             return [
                 ScoreResult(False, None, 1, "") for _ in items
             ]
+
+    @staticmethod
+    def _memory_block(
+        memory: "MemoryConfig", recalled: Optional[list[dict[str, str]]]
+    ) -> str:
+        """Compact memory section: what to remember + what we already reported.
+
+        Only the entries the index matched for this batch are included, so this
+        stays a few short lines (often empty)."""
+        topic_lines = "\n".join(
+            f"  - {t.id}: {t.label}"
+            + (f" — {' '.join(t.description.split())}" if t.description else "")
+            for t in memory.topics
+        )
+        known = ""
+        if recalled:
+            known_lines = "\n".join(
+                f"  - [{e.get('topic','')}] {e.get('subject','')}: "
+                f"{e.get('fact','')} ({e.get('date','')})"
+                for e in recalled
+            )
+            known = (
+                "DAHA ÖNCE RAPOR EDİLENLER (hafıza — bu konular operatöre zaten "
+                "bildirildi):\n"
+                f"{known_lines}\n\n"
+                "Bir öğe yukarıdaki kayıtlardan biriyle AYNI konudaki aynı "
+                "gelişmeyi tekrar ediyorsa repeat=true yap (o öğe rapora "
+                "girmeyecek). Aynı konuda GERÇEKTEN YENİ bir gelişme varsa "
+                "(ör. kayıtlar açıldı -> yarış tamamlandı) repeat=false yap.\n\n"
+            )
+        return (
+            f"{known}"
+            "HAFIZA KONULARI (kalıcı olarak hatırlanacak bilgi türleri):\n"
+            f"{topic_lines}\n\n"
+            "Her öğe için ayrıca şunları döndür: repeat (bool — yukarıdaki "
+            "hafıza kayıtlarının tekrarı mı), memory_topic (öğe bu konulardan "
+            "birine ait yeni bir bilgi taşıyorsa o konunun id'si, yoksa boş "
+            "string) ve memory_subject (bilginin konusu; ör. yarışın tam adı — "
+            "aynı konu için hep AYNI ismi kullan, yoksa boş string).\n\n"
+        )
 
     def _align_results(
         self, data: dict, n: int, interests: Interests
@@ -213,6 +274,11 @@ class LLMClient:
                 category=cat,
                 importance=imp,
                 one_line=self._truncate(str(r.get("one_line", "")), 140),
+                repeat=bool(r.get("repeat", False)),
+                memory_topic=str(r.get("memory_topic", "") or "").strip(),
+                memory_subject=self._truncate(
+                    str(r.get("memory_subject", "") or "").strip(), 120
+                ),
             )
         # Fill any missing index with a safe default.
         return [by_index.get(i, ScoreResult(False, None, 1, "")) for i in range(n)]

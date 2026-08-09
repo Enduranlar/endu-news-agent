@@ -129,6 +129,72 @@ def load_interests(path: Path | None = None) -> Interests:
     return Interests(categories=categories, context=context)
 
 
+@dataclass(frozen=True)
+class MemoryTopic:
+    id: str
+    label: str
+    description: str
+    suppress_repeats: bool
+    ttl_days: int
+
+
+@dataclass(frozen=True)
+class MemoryConfig:
+    """Policy for what the agent remembers across reports (config/memory.yaml).
+
+    `enabled` is False when the file is absent or defines no topics — memory is
+    fully optional and the pipeline behaves exactly as before when off.
+    """
+
+    topics: list[MemoryTopic]
+    max_entries_in_prompt: int = 8
+    default_ttl_days: int = 180
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.topics)
+
+    @property
+    def topic_ids(self) -> list[str]:
+        return [t.id for t in self.topics]
+
+    def topic(self, topic_id: str) -> MemoryTopic | None:
+        for t in self.topics:
+            if t.id == topic_id:
+                return t
+        return None
+
+
+def load_memory_config(path: Path | None = None) -> MemoryConfig:
+    """Load config/memory.yaml. Missing file → disabled memory (not an error)."""
+    path = path or settings.MEMORY_FILE
+    if not path.exists():
+        return MemoryConfig(topics=[])
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    raw_settings = data.get("settings", {}) or {}
+    default_ttl = int(raw_settings.get("default_ttl_days", 180) or 180)
+
+    topics: list[MemoryTopic] = []
+    for t in data.get("topics", []) or []:
+        if not isinstance(t, dict) or not t.get("id"):
+            continue
+        tid = str(t["id"]).strip()
+        topics.append(
+            MemoryTopic(
+                id=tid,
+                label=str(t.get("label", tid)).strip(),
+                description=str(t.get("description", "")).strip(),
+                suppress_repeats=bool(t.get("suppress_repeats", True)),
+                ttl_days=int(t.get("ttl_days", default_ttl) or default_ttl),
+            )
+        )
+    return MemoryConfig(
+        topics=topics,
+        max_entries_in_prompt=int(raw_settings.get("max_entries_in_prompt", 8) or 8),
+        default_ttl_days=default_ttl,
+    )
+
+
 # --- Append helpers for the approve workflow ---------------------------------
 
 
