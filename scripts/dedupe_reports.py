@@ -118,7 +118,8 @@ def _resolve_targets(args_paths: list[str]) -> list[Path]:
             else:
                 print(f"skip (not found): {p}", file=sys.stderr)
         return out
-    return sorted(base.glob("*/*.md"))
+    # reports/<YYYY>/x.md (single agent) and reports/<agent>/<YYYY>/x.md (fleet)
+    return sorted(set(base.glob("*/*.md")) | set(base.glob("*/*/*.md")))
 
 
 def _update_index_counts(processed: dict[str, int]) -> None:

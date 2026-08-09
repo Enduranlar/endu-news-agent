@@ -144,6 +144,32 @@ CREATE TABLE IF NOT EXISTS memory_index (
     PRIMARY KEY (token, memory_id)
 );
 CREATE INDEX IF NOT EXISTS idx_memory_index_token ON memory_index(token);
+
+-- Per-call LLM accounting for the cost report. cost_usd is the real cost when the
+-- provider returns it (OpenRouter); it stays 0 for the direct Anthropic API,
+-- which reports tokens but not price.
+CREATE TABLE IF NOT EXISTS llm_usage (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts                TEXT NOT NULL,
+    day               TEXT NOT NULL,          -- YYYY-MM-DD (Europe/Istanbul)
+    agent             TEXT NOT NULL DEFAULT '',
+    model             TEXT NOT NULL,
+    call_type         TEXT NOT NULL,          -- score|vet|dedupe|summary|race_results
+    prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    cost_usd          REAL NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_llm_usage_day ON llm_usage(day);
+CREATE INDEX IF NOT EXISTS idx_llm_usage_ts ON llm_usage(ts);
+
+-- Shared-run bookkeeping (used in data/shared.db): what the collect phase has
+-- already downloaded, so running N agents doesn't re-fetch article bodies.
+CREATE TABLE IF NOT EXISTS fetched_items (
+    kind             TEXT NOT NULL,           -- 'feed' | 'web' | 'ig'
+    key              TEXT NOT NULL,
+    first_fetched_at TEXT NOT NULL,
+    PRIMARY KEY (kind, key)
+);
 """
 
 # Turkish-aware folding so "Kaçkar"/"kackar" and "İstanbul"/"istanbul" match.
@@ -737,6 +763,64 @@ class Store:
             conn.execute(f"DELETE FROM memory_index WHERE memory_id IN ({qs})", ids)
             conn.execute(f"DELETE FROM memory WHERE id IN ({qs})", ids)
         return len(ids)
+
+    # --- LLM cost accounting --------------------------------------------
+
+    def record_llm_usage(self, agent: str, model: str, call_type: str,
+                         prompt_tokens: int = 0, completion_tokens: int = 0,
+                         cost_usd: float = 0.0, day: Optional[str] = None) -> None:
+        from .timeutil import istanbul_day
+
+        with self.tx() as conn:
+            conn.execute(
+                "INSERT INTO llm_usage(ts, day, agent, model, call_type, "
+                "prompt_tokens, completion_tokens, cost_usd) VALUES(?,?,?,?,?,?,?,?)",
+                (now_iso(), day or istanbul_day(), agent, model, call_type,
+                 prompt_tokens, completion_tokens, cost_usd),
+            )
+
+    def cost_by_model(self, since_day: Optional[str] = None) -> list[sqlite3.Row]:
+        """Per-model spend; `since_day` is 'YYYY-MM-DD'."""
+        sql = ("SELECT agent, model, COUNT(*) AS calls, "
+               "SUM(prompt_tokens + completion_tokens) AS tokens, "
+               "SUM(cost_usd) AS cost FROM llm_usage")
+        params: list = []
+        if since_day:
+            sql += " WHERE day >= ?"
+            params.append(since_day)
+        sql += " GROUP BY agent, model ORDER BY cost DESC"
+        return self.conn.execute(sql, params).fetchall()
+
+    def _cost_agg(self, where: str, params: list) -> dict:
+        r = self.conn.execute(
+            "SELECT COUNT(*) AS calls, "
+            "COALESCE(SUM(prompt_tokens + completion_tokens),0) AS tokens, "
+            "COALESCE(SUM(cost_usd),0) AS cost FROM llm_usage" + where, params
+        ).fetchone()
+        return {"calls": r["calls"], "tokens": r["tokens"], "cost": r["cost"]}
+
+    def cost_totals(self, since_day: Optional[str] = None) -> dict:
+        if since_day:
+            return self._cost_agg(" WHERE day >= ?", [since_day])
+        return self._cost_agg("", [])
+
+    def cost_since_ts(self, since_iso: Optional[str]) -> dict:
+        """Spend since an ISO timestamp — used for each report's cost footer."""
+        if since_iso:
+            return self._cost_agg(" WHERE ts > ?", [since_iso])
+        return self._cost_agg("", [])
+
+    # --- Shared-run bookkeeping (shared.db) ------------------------------
+
+    def mark_fetched(self, kind: str, key: str) -> bool:
+        """True the first time an item is seen — i.e. worth downloading.
+
+        Lives in the shared DB so N agents don't each re-download the same page."""
+        with self.tx() as conn:
+            return conn.execute(
+                "INSERT OR IGNORE INTO fetched_items(kind, key, first_fetched_at) "
+                "VALUES(?,?,?)", (kind, key, now_iso())
+            ).rowcount > 0
 
     # --- Maintenance / status ------------------------------------------
 

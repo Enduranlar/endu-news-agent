@@ -77,6 +77,7 @@ cp config/igaccounts.md.example  config/igaccounts.md
 cp config/websites.md.example    config/websites.md
 cp config/interests.yaml.example config/interests.yaml
 cp config/memory.yaml.example    config/memory.yaml       # optional (see Memory)
+cp config/agents.yaml.example    config/agents.yaml       # optional (see Running several models)
 $EDITOR config/igaccounts.md     # one IG handle per line
 $EDITOR config/websites.md       # rss|<url> or site|<url> per line
 $EDITOR config/interests.yaml    # categories + business context (tunes the LLM)
@@ -124,8 +125,8 @@ send.
 
 | Command | Purpose |
 |---|---|
-| `daily` | Ingest IG + web, score relevance, run discovery. Cron 06:30. |
-| `report --period monday\|friday` | Build + archive + email the summary. Cron Mon/Fri 08:00. `--force` to resend. |
+| `daily` | Ingest IG + web, score relevance, run discovery. Cron 06:30. `--agent NAME` to limit. |
+| `report --period monday\|friday` | Build + archive + email one summary **per agent**. `--force` to resend, `--agent NAME` to limit. |
 | `discover` | Run source discovery on its own. |
 | `web` | Run the web admin UI (review suggestions, manual add) — bind to your Tailscale IP. |
 | `add-site <url> [note]` | Auto-detect a site's RSS/Atom feed and add it to `config/websites.md`. |
@@ -133,7 +134,7 @@ send.
 | `approve --ig <handle>` | Approve an IG suggestion → append to `config/igaccounts.md`. |
 | `approve --site <url> [--as rss\|site]` | Approve a website → append to `config/websites.md`. |
 | `dismiss --id <n>` | Dismiss a suggestion; it never resurfaces. |
-| `status` | Last-run times, today's credit spend, DB counts. |
+| `status` | Per-agent counts + **LLM cost**, shared credit spend. `--sources` lists sources. |
 | `memory [--topic X] [--query Q] [--forget ID] [--purge-expired]` | Inspect / prune what the agent remembers. |
 | `test-races [--all] [--limit N]` | Fetch + parse the teamrunbo race calendar (no DB writes). |
 | `test-sociavault --handle <h>` | Live profile call (field-path check). |
@@ -252,6 +253,63 @@ python -m src.main dismiss --id 42                # never resurfaced
 Approved sources start being tracked on the next `daily` run (sources reconcile
 from the config files into the DB each run; removed lines are marked inactive, not
 deleted).
+
+---
+
+## Running several models side by side (agent fleet)
+
+Compare models on the *same* input: create `config/agents.yaml` (copy the
+`.example`) and each agent runs the whole pipeline with its own model.
+
+```yaml
+agents:
+  - name: haiku
+    model: anthropic/claude-haiku-4.5       # OpenRouter model id
+    summary_model: anthropic/claude-sonnet-4.6
+    primary: true
+  - name: gemini-flash
+    model: google/gemini-2.5-flash
+  - name: gpt5-mini
+    model: openai/gpt-5-mini
+    enabled: false                           # parked, costs nothing
+```
+
+**Shared once per run** — so a fleet costs the same SociaVault credits and web
+traffic as a single agent: every SociaVault call, all RSS/site fetches, the race
+calendar, and the discovery candidate lookups. **Per agent**: database, memory,
+suggestions, reports and cost.
+
+```
+data/shared.db                  SociaVault credit log + fetch dedup (global)
+data/agents/<name>.db           that agent's items, scores, memory, cost
+reports/<name>/<YYYY>/...md     that agent's archive (+ its own index)
+```
+
+Agents run **in parallel** (thread pool; separate SQLite files, so no
+contention). You get **one email per agent**, subject-tagged `[haiku] …`, each
+ending with what that report cost. Suggestions from every agent land in the same
+`igaccounts.md` / `websites.md` when approved — the web UI merges them and shows
+which agents proposed each.
+
+```bash
+python -m src.main daily                 # all enabled agents
+python -m src.main daily --agent haiku   # just one
+python -m src.main status                # per-agent counts + spend
+```
+
+**No `agents.yaml` → single-agent mode**, using `data/agent.db`, `reports/`, and
+the models from `.env` — exactly as before.
+
+### Cost tracking
+
+With `OPENROUTER_API_KEY` set, every call's **real cost** (returned by OpenRouter)
+is logged per agent and model, and shows up in two places: a **cost panel in the
+web admin UI** (today / 7d / 30d per agent) and a **footer line on each report**
+("Bu rapor: 84 çağrı · 412k token · $0.31"). `status` prints the same totals.
+
+> Agents pinned with `provider: anthropic` use the direct Anthropic API, which
+> reports tokens but not price — those calls log $0. Also pick models that
+> support structured outputs (JSON schema); the pipeline relies on them.
 
 ---
 

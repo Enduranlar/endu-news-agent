@@ -19,14 +19,66 @@ import logging
 import traceback
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Optional
+from datetime import timedelta
 from urllib.parse import parse_qs, urlencode, urlparse
 
 from . import settings
-from .config_loader import _normalize_handle, append_ig_account
+from .config_loader import _normalize_handle, append_ig_account, load_agents
 from .feed_detect import add_website
 from .store import Store
 
 log = logging.getLogger("agent.web")
+
+
+def _agents():
+    return load_agents(env_default=("", ""))
+
+
+def _strip_www(host: str) -> str:
+    return host[4:] if host.startswith("www.") else host
+
+
+def gather_suggestions() -> list[dict]:
+    """Pending suggestions across every agent, merged by (kind, key).
+
+    Different models propose different sources; show each candidate once and note
+    which agents proposed it (approving appends to the shared config file)."""
+    merged: dict = {}
+    for agent in _agents():
+        if not agent.db_path.exists():
+            continue
+        with Store(agent.db_path) as store:
+            for row in store.pending_suggestions():
+                key = (row["kind"], row["key"])
+                entry = merged.get(key)
+                if entry is None:
+                    entry = dict(row)
+                    entry["agents"] = []
+                    merged[key] = entry
+                entry["agents"].append(agent.name)
+    return sorted(merged.values(), key=lambda e: (e.get("created_at") or ""), reverse=True)
+
+
+def gather_costs() -> list[dict]:
+    """Per-agent LLM spend for today / 7d / 30d."""
+    from .timeutil import istanbul_now
+
+    now = istanbul_now()
+    windows = {
+        "today": now.strftime("%Y-%m-%d"),
+        "d7": (now - timedelta(days=7)).strftime("%Y-%m-%d"),
+        "d30": (now - timedelta(days=30)).strftime("%Y-%m-%d"),
+    }
+    rows = []
+    for agent in _agents():
+        if not agent.db_path.exists():
+            continue
+        with Store(agent.db_path) as store:
+            row = {"agent": agent.name, "model": agent.model}
+            for k, d in windows.items():
+                row[k] = float(store.cost_totals(since_day=d).get("cost") or 0.0)
+            rows.append(row)
+    return rows
 
 
 # --- HTML rendering ----------------------------------------------------------
@@ -58,6 +110,12 @@ h2 { font-size: 15px; margin: 24px 0 10px; color: #333;
   vertical-align: middle; }
 .badge.ig { background: #c13584; }
 .badge.site, .badge.rss { background: #2563eb; }
+.badge.agent { background: #475569; font-weight: 500; }
+table.cost { width: 100%; border-collapse: collapse; font-size: 14px; }
+table.cost th, table.cost td { text-align: left; padding: 6px 4px; border-bottom: 1px solid #eee; }
+table.cost td.num, table.cost th.num { text-align: right; font-variant-numeric: tabular-nums; }
+table.cost tr.tot td { font-weight: 700; border-bottom: 0; }
+.cmodel { color: #999; font-size: 11px; }
 .reason { margin: 8px 0 4px; font-size: 14px; }
 .meta { color: #888; font-size: 12px; margin-bottom: 10px; }
 .actions { display: flex; gap: 8px; flex-wrap: wrap; }
@@ -89,7 +147,7 @@ def _suggestion_link_title(s) -> tuple[str, str]:
     return s["key"], s["key"]
 
 
-def render_page(suggestions, message: str = "", is_error: bool = False) -> str:
+def render_page(suggestions, costs=None, message: str = "", is_error: bool = False) -> str:
     flash = ""
     if message:
         cls = "flash err" if is_error else "flash"
@@ -107,12 +165,15 @@ def render_page(suggestions, message: str = "", is_error: bool = False) -> str:
         if s["created_at"]:
             meta_bits.append(_esc(str(s["created_at"])[:10]))
         meta = " · ".join(meta_bits)
+        agent_badges = "".join(
+            f'<span class="badge agent">{_esc(a)}</span>' for a in (s.get("agents") or [])
+        )
         cards.append(
             f"""
         <div class="card">
           <div>
             <a class="title" href="{_esc(link)}" target="_blank" rel="noopener">{_esc(title)}</a>
-            <span class="badge {badge}">{_esc(badge)}</span>
+            <span class="badge {badge}">{_esc(badge)}</span>{agent_badges}
           </div>
           <div class="reason">{_esc(s['reason'])}</div>
           <div class="meta">{meta}</div>
@@ -124,7 +185,8 @@ def render_page(suggestions, message: str = "", is_error: bool = False) -> str:
               <button class="btn btn-add" type="submit">Ekle</button>
             </form>
             <form class="inline" method="post" action="/dismiss">
-              <input type="hidden" name="id" value="{_esc(s['id'])}">
+              <input type="hidden" name="kind" value="{_esc(s['kind'])}">
+              <input type="hidden" name="key" value="{_esc(s['key'])}">
               <button class="btn btn-dismiss" type="submit">Yoksay</button>
             </form>
           </div>
@@ -132,10 +194,31 @@ def render_page(suggestions, message: str = "", is_error: bool = False) -> str:
         )
 
     suggestions_html = (
-        "\n".join(cards)
-        if cards
-        else '<div class="empty">Bekleyen öneri yok.</div>'
+        "\n".join(cards) if cards else '<div class="empty">Bekleyen öneri yok.</div>'
     )
+
+    cost_rows = ""
+    if costs:
+        t_today = sum(c["today"] for c in costs)
+        t_30 = sum(c["d30"] for c in costs)
+        body = "".join(
+            f"<tr><td>{_esc(c['agent'])}<div class=\"cmodel\">{_esc(c['model'])}</div></td>"
+            f"<td class=\"num\">${c['today']:.4f}</td>"
+            f"<td class=\"num\">${c['d7']:.4f}</td>"
+            f"<td class=\"num\">${c['d30']:.4f}</td></tr>"
+            for c in costs
+        )
+        cost_rows = f"""
+    <h2>Maliyet (model harcaması)</h2>
+    <div class="card">
+      <table class="cost">
+        <tr><th>Ajan</th><th class="num">Bugün</th><th class="num">7 gün</th>
+            <th class="num">30 gün</th></tr>
+        {body}
+        <tr class="tot"><td>TOPLAM</td><td class="num">${t_today:.4f}</td>
+            <td class="num"></td><td class="num">${t_30:.4f}</td></tr>
+      </table>
+    </div>"""
 
     return f"""<!DOCTYPE html>
 <html lang="tr">
@@ -153,6 +236,7 @@ def render_page(suggestions, message: str = "", is_error: bool = False) -> str:
 
     <h2>Bekleyen öneriler</h2>
     {suggestions_html}
+    {cost_rows}
 
     <h2>Manuel ekle</h2>
     <div class="add-grid">
@@ -232,9 +316,7 @@ class Handler(BaseHTTPRequestHandler):
         q = parse_qs(parsed.query)
         message = q.get("msg", [""])[0]
         is_error = q.get("err", [""])[0] == "1"
-        with Store() as store:
-            suggestions = store.pending_suggestions()
-            self._html(render_page(suggestions, message, is_error))
+        self._html(render_page(gather_suggestions(), gather_costs(), message, is_error))
 
     def do_POST(self) -> None:
         length = int(self.headers.get("Content-Length", "0") or "0")
@@ -245,61 +327,65 @@ class Handler(BaseHTTPRequestHandler):
             return fields.get(name, [default])[0].strip()
 
         try:
-            with Store() as store:
-                msg = self._dispatch(self.path, f, store)
+            msg = self._dispatch(self.path, f)
             self._redirect(msg)
         except Exception as exc:  # noqa: BLE001 — surface as a flash, never 500-crash
             log.error("admin action failed:\n%s", traceback.format_exc())
             self._redirect(f"Hata: {exc}", is_error=True)
 
-    def _dispatch(self, path: str, f, store: Store) -> str:
+    def _dispatch(self, path: str, f) -> str:
+        """Apply an action across the whole fleet.
+
+        Suggestions live in each agent's DB but feed shared config files, so a
+        decision is marked in EVERY agent's DB (no agent re-suggests it) while the
+        config file is appended once."""
         proxy = self.server.proxy  # type: ignore[attr-defined]
         path = urlparse(path).path
+        agents = [a for a in _agents() if a.db_path.exists()]
+
+        def mark_all(kind: str, key: str, status: str) -> None:
+            for agent in agents:
+                with Store(agent.db_path) as store:
+                    store.set_suggestion_status_by_key(kind, key, status)
 
         if path == "/dismiss":
-            sid = int(f("id"))
-            store.set_suggestion_status(sid, "dismissed")
+            kind, key = f("kind"), f("key")
+            if not key:
+                return "Geçersiz öneri."
+            mark_all(kind, key, "dismissed")
             return "Öneri yoksayıldı."
 
         if path == "/approve":
-            kind = f("kind")
-            key = f("key")
+            kind, key = f("kind"), f("key")
             if kind == "ig":
                 handle = _normalize_handle(key)
                 added = append_ig_account(handle)
-                store.set_suggestion_status_by_key("ig", handle, "approved")
-                return (
-                    f"@{handle} eklendi (igaccounts.md)."
-                    if added
-                    else f"@{handle} zaten ekli; öneri onaylandı."
-                )
-            # website suggestion → RSS auto-detection
+                mark_all("ig", handle, "approved")
+                mark_all("ig", key, "approved")
+                return (f"@{handle} eklendi (igaccounts.md)." if added
+                        else f"@{handle} zaten ekli; öneri onaylandı.")
             res = add_website(key, proxy=proxy)
-            store.set_suggestion_status_by_key("site", key, "approved")
-            store.set_suggestion_status_by_key("rss", key, "approved")
-            kind_label = "RSS" if res.detection.kind == "rss" else "site"
-            return f"{key} eklendi ({kind_label})."
+            mark_all("site", key, "approved")
+            mark_all("rss", key, "approved")
+            return f"{key} eklendi ({'RSS' if res.detection.kind == 'rss' else 'site'})."
 
         if path == "/add-ig":
             handle = _normalize_handle(f("handle"))
             if not handle:
                 return "Geçersiz Instagram kullanıcı adı."
             added = append_ig_account(handle, f("note"))
-            store.set_suggestion_status_by_key("ig", handle, "approved")
-            return (
-                f"@{handle} eklendi (igaccounts.md)."
-                if added
-                else f"@{handle} zaten ekli."
-            )
+            mark_all("ig", handle, "approved")
+            return (f"@{handle} eklendi (igaccounts.md)." if added
+                    else f"@{handle} zaten ekli.")
 
         if path == "/add-site":
             url = f("url")
             if not url:
                 return "Geçersiz URL."
             res = add_website(url, note=f("note"), proxy=proxy)
-            host = (urlparse(res.detection.site_url).hostname or "").lstrip("www.")
+            host = _strip_www((urlparse(res.detection.site_url).hostname or ""))
             if host:
-                store.set_suggestion_status_by_key("site", f"https://{host}", "approved")
+                mark_all("site", f"https://{host}", "approved")
             kind_label = "RSS" if res.detection.kind == "rss" else "site"
             verb = "eklendi" if res.added else "zaten ekli"
             return f"{res.detection.site_url} {verb} ({kind_label})."

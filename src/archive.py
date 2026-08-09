@@ -26,12 +26,17 @@ class ArchivedReport:
     relpath: str
 
 
-def archive_report(bundle: ReportBundle) -> ArchivedReport:
-    settings.REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+def archive_report(
+    bundle: ReportBundle, reports_dir: Path | None = None
+) -> ArchivedReport:
+    """Archive a report. `reports_dir` defaults to the shared reports/ root; each
+    agent passes its own reports/<agent>/ so fleets keep separate histories."""
+    base = reports_dir or settings.REPORTS_DIR
+    base.mkdir(parents=True, exist_ok=True)
     now = istanbul_now()
     year = now.strftime("%Y")
     day = now.strftime("%Y-%m-%d")
-    year_dir = settings.REPORTS_DIR / year
+    year_dir = base / year
     year_dir.mkdir(parents=True, exist_ok=True)
 
     filename = f"{day}_{bundle.period}.md"
@@ -39,18 +44,19 @@ def archive_report(bundle: ReportBundle) -> ArchivedReport:
     path.write_text(bundle.markdown, encoding="utf-8")
     relpath = f"{year}/{filename}"
 
-    _update_index_json(bundle, day, relpath)
-    _update_index_md()
+    _update_index_json(bundle, day, relpath, base)
+    _update_index_md(base)
     log.info("archived report -> %s", path)
     return ArchivedReport(path=path, relpath=relpath)
 
 
-def _index_json_path() -> Path:
-    return settings.REPORTS_DIR / "index.json"
+def _index_json_path(base: Path | None = None) -> Path:
+    return (base or settings.REPORTS_DIR) / "index.json"
 
 
-def _update_index_json(bundle: ReportBundle, day: str, relpath: str) -> None:
-    path = _index_json_path()
+def _update_index_json(bundle: ReportBundle, day: str, relpath: str,
+                       base: Path | None = None) -> None:
+    path = _index_json_path(base)
     entries = []
     if path.exists():
         try:
@@ -72,10 +78,11 @@ def _update_index_json(bundle: ReportBundle, day: str, relpath: str) -> None:
     path.write_text(json.dumps(entries, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def _update_index_md() -> None:
+def _update_index_md(base: Path | None = None) -> None:
     """Regenerate the human-readable index from index.json, newest first."""
+    base = base or settings.REPORTS_DIR
     entries = []
-    jpath = _index_json_path()
+    jpath = _index_json_path(base)
     if jpath.exists():
         try:
             entries = json.loads(jpath.read_text(encoding="utf-8"))
@@ -96,6 +103,6 @@ def _update_index_md() -> None:
             f"{e.get('item_count', 0)} items"
             + (f" — {cats}" if cats else "")
         )
-    (settings.REPORTS_DIR / "index.md").write_text(
+    (base / "index.md").write_text(
         "\n".join(lines) + "\n", encoding="utf-8"
     )

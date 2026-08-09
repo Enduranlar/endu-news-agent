@@ -80,7 +80,7 @@ def _resolve_targets(args_paths: list[str]) -> list[Path]:
             else:
                 print(f"skip (not found): {p}", file=sys.stderr)
         return out
-    return sorted(base.glob("*/*.md"))
+    return sorted(set(base.glob("*/*.md")) | set(base.glob("*/*/*.md")))
 
 
 def main(argv: list[str]) -> int:

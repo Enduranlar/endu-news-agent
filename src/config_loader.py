@@ -9,7 +9,8 @@ the config files (the `approve` workflow).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import yaml
@@ -193,6 +194,95 @@ def load_memory_config(path: Path | None = None) -> MemoryConfig:
         max_entries_in_prompt=int(raw_settings.get("max_entries_in_prompt", 8) or 8),
         default_ttl_days=default_ttl,
     )
+
+
+@dataclass(frozen=True)
+class AgentConfig:
+    """One agent in the fleet: a model plus its own DB / reports / cost.
+
+    `legacy` marks the implicit single agent used when config/agents.yaml is
+    absent — it keeps the original data/agent.db and reports/ paths so existing
+    deployments are untouched.
+    """
+
+    name: str
+    model: str
+    summary_model: str = ""
+    provider: str = ""  # "" = auto (openrouter when its key is set)
+    enabled: bool = True
+    primary: bool = False
+    legacy: bool = False
+
+    @property
+    def db_path(self) -> Path:
+        if self.legacy:
+            return settings.DB_FILE
+        return settings.DATA_DIR / "agents" / f"{self.name}.db"
+
+    @property
+    def reports_dir(self) -> Path:
+        if self.legacy:
+            return settings.REPORTS_DIR
+        return settings.REPORTS_DIR / self.name
+
+    @property
+    def filter_model(self) -> str:
+        return self.model
+
+    @property
+    def report_model(self) -> str:
+        return self.summary_model or self.model
+
+
+_SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def load_agents(path: Path | None = None, env_default=None) -> list[AgentConfig]:
+    """Load the agent fleet. Missing file → one implicit legacy agent from .env.
+
+    Only enabled agents are returned; exactly one is marked primary."""
+    path = path or settings.AGENTS_FILE
+    if not path.exists():
+        filter_model, summary_model = env_default or ("", "")
+        return [
+            AgentConfig(
+                name="default", model=filter_model, summary_model=summary_model,
+                enabled=True, primary=True, legacy=True,
+            )
+        ]
+
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    agents: list[AgentConfig] = []
+    seen: set[str] = set()
+    for a in data.get("agents", []) or []:
+        if not isinstance(a, dict) or not a.get("name") or not a.get("model"):
+            continue
+        name = str(a["name"]).strip()
+        if not _SAFE_NAME.match(name):
+            raise settings.ConfigError(
+                f"agent name {name!r} must be alphanumeric (dots/dashes/underscores ok)"
+            )
+        if name in seen:
+            raise settings.ConfigError(f"duplicate agent name {name!r} in agents.yaml")
+        seen.add(name)
+        if not bool(a.get("enabled", True)):
+            continue
+        agents.append(
+            AgentConfig(
+                name=name,
+                model=str(a["model"]).strip(),
+                summary_model=str(a.get("summary_model", "") or "").strip(),
+                provider=str(a.get("provider", "") or "").strip().lower(),
+                enabled=True,
+                primary=bool(a.get("primary", False)),
+            )
+        )
+
+    if not agents:
+        raise settings.ConfigError("agents.yaml defines no enabled agents")
+    if not any(a.primary for a in agents):
+        agents[0] = replace(agents[0], primary=True)
+    return agents
 
 
 # --- Append helpers for the approve workflow ---------------------------------

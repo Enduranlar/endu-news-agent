@@ -276,10 +276,13 @@ def run_race_tracking(
     interests: Interests,
     today: date,
     since_floor: Optional[date] = None,
+    calendar_html: Optional[str] = None,
 ) -> RaceTrackResult:
+    """Track TR races. `calendar_html` lets the caller fetch the calendar once and
+    reuse it across agents (the LLM results extraction still runs per agent)."""
     result = RaceTrackResult()
 
-    html = fetcher.get_text(CALENDAR_URL)
+    html = calendar_html if calendar_html is not None else fetcher.get_text(CALENDAR_URL)
     if not html:
         log.warning("race calendar fetch failed: %s", CALENDAR_URL)
         result.fetch_ok = False
