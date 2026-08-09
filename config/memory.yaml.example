@@ -1,0 +1,70 @@
+# Agent memory policy — what the agent should REMEMBER across reports.
+#
+# Problem this solves: without memory, a recurring story ("X yarışının kayıtları
+# açık") is a brand-new item every time it's posted, so it shows up in report after
+# report. With memory, the agent records the fact once and recognises later posts
+# about the SAME subject as repeats, and drops them.
+#
+# SETUP: copy this file to `memory.yaml` and tune it (or put your real memory.yaml
+# in $AGENT_STATE_DIR/config/ if you keep state in a separate repo):
+#
+#   cp config/memory.yaml.example config/memory.yaml
+#
+# Delete the file (or leave `topics` empty) to disable memory entirely.
+#
+# HOW IT STAYS CHEAP: memory is NOT dumped into every prompt. Each entry is stored
+# with a normalized subject (e.g. "kanyon-ulubey-ultra-trail") that is indexed by
+# token. When scoring new items the agent looks up only the entries whose subject
+# tokens appear in those items, and passes at most `max_entries_in_prompt` of them
+# to the model. Typical cost: a few short lines, often zero.
+
+topics:
+  - id: registration_open
+    label: "Yarış kayıtlarının açılması"
+    # `description` is fed to the model: it decides when to record this topic and
+    # what the subject is. Be explicit about what the SUBJECT should be.
+    description: >
+      Bir yarışın kayıtlarının açıldığı/başladığı duyurusu. Konu (subject) yarışın
+      tam adıdır, ör. "Kanyon Ulubey Ultra Trail".
+    # Suppress later items about the same subject+topic (this is the point).
+    suppress_repeats: true
+    # How long the memory stays in effect. Registration stays open for months.
+    ttl_days: 365
+
+  - id: product_launch
+    label: "Ürün lansmanı"
+    description: >
+      Bir markanın yeni ürün / tat / paket duyurusu. Konu (subject) "marka +
+      ürün adı" olmalı, ör. "Maurten Gel 100 Espresso".
+    suppress_repeats: true
+    ttl_days: 180
+
+  - id: race_result
+    label: "Yarış sonucu"
+    description: >
+      Tamamlanmış bir yarışın sonuçları / kazananları. Konu (subject) yarışın adı
+      ve yılıdır, ör. "Kaçkar by UTMB 2026".
+    suppress_repeats: true
+    ttl_days: 120
+
+  - id: record
+    label: "Kırılan rekor"
+    description: >
+      Kırılan bir rekor. Konu (subject) rekorun tanımıdır, ör. "Erkekler maraton
+      dünya rekoru".
+    suppress_repeats: true
+    ttl_days: 365
+
+  - id: sponsorship
+    label: "Sponsorluk / iş birliği"
+    description: >
+      Sporcu–marka sponsorluğu veya iki kurum arasında iş birliği duyurusu. Konu
+      (subject) "taraf A + taraf B" olmalı.
+    suppress_repeats: true
+    ttl_days: 365
+
+settings:
+  # Max memory entries included in a single scoring prompt (keeps context small).
+  max_entries_in_prompt: 8
+  # Used when a topic doesn't set ttl_days.
+  default_ttl_days: 180

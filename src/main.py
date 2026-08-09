@@ -29,6 +29,7 @@ from .config_loader import (
     append_web_source,
     load_ig_accounts,
     load_interests,
+    load_memory_config,
     load_web_sources,
 )
 from .logging_setup import setup_logging
@@ -65,6 +66,7 @@ def cmd_daily(args: argparse.Namespace) -> int:
         ig_accounts = load_ig_accounts()
         web_sources = load_web_sources()
         interests = load_interests()
+        memory = load_memory_config()
         rec = store.reconcile_sources(ig_accounts, web_sources)
         log.info(
             "sources reconciled: +%d new, %d reactivated, %d deactivated",
@@ -115,7 +117,7 @@ def cmd_daily(args: argparse.Namespace) -> int:
                     race_res = _track_races(fetcher)
 
                     # Relevance scoring (LLM).
-                    rel = score_pending(store, llm, interests)
+                    rel = score_pending(store, llm, interests, memory)
 
                     # Discovery (credit-spending, lowest priority).
                     disc = run_discovery(
@@ -132,7 +134,7 @@ def cmd_daily(args: argparse.Namespace) -> int:
                     since_ts=since_ts,
                 )
                 race_res = _track_races(fetcher)
-                rel = score_pending(store, llm, interests)
+                rel = score_pending(store, llm, interests, memory)
                 new_suggestions = 0
 
         skipped_old += web_res.skipped_old
@@ -142,26 +144,30 @@ def cmd_daily(args: argparse.Namespace) -> int:
             datetime.now(timezone.utc) - timedelta(days=cfg.raw_item_retention_days)
         ).isoformat()
         purged = store.purge_old_raw_items(cutoff)
+        mem_purged = store.purge_expired_memory()
 
         races_new = race_res.new_races if race_res else 0
         race_results_found = race_res.results_found if race_res else 0
 
         log.info(
             "RUN SUMMARY (daily%s): new_ig=%d new_web=%d skipped_old=%d scored=%d "
-            "relevant=%d new_suggestions=%d races_new=%d race_results=%d "
-            "credits_spent=%d/%d purged=%d%s",
+            "relevant=%d repeats=%d remembered=%d new_suggestions=%d races_new=%d "
+            "race_results=%d credits_spent=%d/%d purged=%d/%d%s",
             " dry-run" if dry else "",
             new_ig,
             web_res.new_items,
             skipped_old,
             rel.scored,
             rel.relevant,
+            rel.repeats,
+            rel.remembered,
             new_suggestions,
             races_new,
             race_results_found,
             tracker.spent(),
             cfg.sociavault_daily_credit_budget,
             purged,
+            mem_purged,
             " [BUDGET HIT]" if budget_hit else "",
         )
     return 0
@@ -336,6 +342,49 @@ def cmd_web(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_memory(args: argparse.Namespace) -> int:
+    """Inspect / prune what the agent remembers across reports."""
+    with Store() as store:
+        if args.forget is not None:
+            ok = store.forget_memory(args.forget)
+            print(
+                f"Memory #{args.forget} forgotten."
+                if ok
+                else f"No memory entry with id {args.forget}."
+            )
+            return 0 if ok else 1
+
+        if args.purge_expired:
+            n = store.purge_expired_memory()
+            print(f"Purged {n} expired memory entr{'y' if n == 1 else 'ies'}.")
+            return 0
+
+        memory = load_memory_config()
+        if not memory.enabled:
+            print(
+                "Memory is disabled (no config/memory.yaml topics). "
+                "Copy config/memory.yaml.example to enable it."
+            )
+
+        rows = store.list_memory(topic=args.topic, query=args.query or "", limit=args.limit)
+        if not rows:
+            print("No memory entries.")
+            return 0
+        print(f"{len(rows)} memory entr{'y' if len(rows) == 1 else 'ies'}:\n")
+        for r in rows:
+            exp = r["expires_at"] or "never"
+            print(f"[#{r['id']}] ({r['topic']}) {r['subject']}")
+            print(f"      {r['fact']}")
+            print(
+                f"      seen {r['times_seen']}x · first {(r['first_seen_at'] or '')[:10]}"
+                f" · expires {exp}"
+            )
+            if r["source_url"]:
+                print(f"      {r['source_url']}")
+            print(f"      forget: python -m src.main memory --forget {r['id']}\n")
+    return 0
+
+
 def cmd_dismiss(args: argparse.Namespace) -> int:
     with Store() as store:
         ok = store.set_suggestion_status(args.id, "dismissed")
@@ -492,6 +541,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_web.add_argument("--host", help="bind address (default WEB_LISTEN_HOST or 127.0.0.1)")
     p_web.add_argument("--port", type=int, help="port (default WEB_LISTEN_PORT or 8765)")
     p_web.set_defaults(func=cmd_web)
+
+    p_mem = sub.add_parser("memory", help="inspect what the agent remembers")
+    p_mem.add_argument("--topic", help="filter by memory topic id")
+    p_mem.add_argument("--query", help="substring match on subject/fact")
+    p_mem.add_argument("--limit", type=int, default=50)
+    p_mem.add_argument("--forget", type=int, metavar="ID", help="delete one entry")
+    p_mem.add_argument(
+        "--purge-expired", action="store_true", help="delete all expired entries"
+    )
+    p_mem.set_defaults(func=cmd_memory)
 
     p_dis = sub.add_parser("dismiss", help="dismiss a suggestion")
     p_dis.add_argument("--id", type=int, required=True)

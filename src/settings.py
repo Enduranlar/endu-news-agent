@@ -34,6 +34,7 @@ LOGS_DIR = ROOT / "logs"
 IG_ACCOUNTS_FILE = CONFIG_DIR / "igaccounts.md"
 WEBSITES_FILE = CONFIG_DIR / "websites.md"
 INTERESTS_FILE = CONFIG_DIR / "interests.yaml"
+MEMORY_FILE = CONFIG_DIR / "memory.yaml"
 DB_FILE = DATA_DIR / "agent.db"
 LOG_FILE = LOGS_DIR / "agent.log"
 

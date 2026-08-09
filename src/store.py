@@ -11,10 +11,11 @@ No ORM — the schema is small and we want it debuggable on a VPS.
 from __future__ import annotations
 
 import hashlib
+import re
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
@@ -118,7 +119,57 @@ CREATE TABLE IF NOT EXISTS races (
     updated_at      TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_races_tr_status ON races(is_tr, status);
+
+-- Long-term memory: facts the agent has already reported, so recurring stories
+-- (e.g. "registration is open") aren't repeated in later reports. Recall is via
+-- the inverted token index below, so prompts only carry the few relevant entries.
+CREATE TABLE IF NOT EXISTS memory (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    topic         TEXT NOT NULL,          -- topic id from memory.yaml
+    subject_key   TEXT NOT NULL,          -- normalized subject slug
+    subject       TEXT NOT NULL,          -- subject as written
+    fact          TEXT NOT NULL,          -- one-line fact
+    source_url    TEXT DEFAULT '',
+    token_count   INTEGER NOT NULL DEFAULT 0,
+    times_seen    INTEGER NOT NULL DEFAULT 1,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at  TEXT NOT NULL,
+    expires_at    TEXT,                    -- YYYY-MM-DD; NULL = never expires
+    UNIQUE(topic, subject_key)
+);
+
+CREATE TABLE IF NOT EXISTS memory_index (
+    token     TEXT NOT NULL,
+    memory_id INTEGER NOT NULL,
+    PRIMARY KEY (token, memory_id)
+);
+CREATE INDEX IF NOT EXISTS idx_memory_index_token ON memory_index(token);
 """
+
+# Turkish-aware folding so "Kaçkar"/"kackar" and "İstanbul"/"istanbul" match.
+_MEM_FOLD = str.maketrans("ıİşŞğĞüÜöÖçÇâÂîÎûÛ", "iissgguuooccaaiiuu")
+
+# Very common words that would create useless index hits.
+_MEM_STOPWORDS = {
+    "and", "the", "for", "with", "ile", "ve", "icin", "bir", "bu", "kayit",
+    "kayitlar", "yaris", "yarisi", "race", "run", "kosu", "etkinlik", "event",
+    "2024", "2025", "2026", "2027",
+}
+
+
+def memory_tokens(text: str) -> set[str]:
+    """Normalized tokens used for memory indexing/recall (Turkish-folded)."""
+    folded = (text or "").translate(_MEM_FOLD).lower()
+    out = set()
+    for raw in re.split(r"[^a-z0-9]+", folded):
+        if len(raw) >= 3 and raw not in _MEM_STOPWORDS:
+            out.add(raw)
+    return out
+
+
+def subject_slug(subject: str) -> str:
+    folded = (subject or "").translate(_MEM_FOLD).lower()
+    return re.sub(r"[^a-z0-9]+", "-", folded).strip("-")[:120]
 
 
 def now_iso() -> str:
@@ -570,6 +621,123 @@ class Store:
                 (summary, now_iso(), race_key),
             )
 
+    # --- Memory ---------------------------------------------------------
+
+    def remember(
+        self,
+        topic: str,
+        subject: str,
+        fact: str,
+        source_url: str = "",
+        ttl_days: Optional[int] = None,
+        today: Optional[str] = None,
+    ) -> bool:
+        """Record (or refresh) a memory entry. Returns True if newly created.
+
+        Keyed by (topic, subject_key) so the same story about the same subject
+        collapses into one entry with a times_seen counter."""
+        key = subject_slug(subject)
+        if not key or not fact.strip():
+            return False
+        expires = None
+        if ttl_days:
+            base = datetime.strptime(today, "%Y-%m-%d") if today else datetime.now(timezone.utc)
+            expires = (base + timedelta(days=int(ttl_days))).strftime("%Y-%m-%d")
+
+        tokens = memory_tokens(subject)
+        with self.tx() as conn:
+            row = conn.execute(
+                "SELECT id FROM memory WHERE topic=? AND subject_key=?", (topic, key)
+            ).fetchone()
+            if row is not None:
+                conn.execute(
+                    "UPDATE memory SET times_seen=times_seen+1, last_seen_at=?, "
+                    "expires_at=COALESCE(?, expires_at) WHERE id=?",
+                    (now_iso(), expires, row["id"]),
+                )
+                return False
+            cur = conn.execute(
+                "INSERT INTO memory(topic, subject_key, subject, fact, source_url, "
+                "token_count, times_seen, first_seen_at, last_seen_at, expires_at) "
+                "VALUES(?,?,?,?,?,?,1,?,?,?)",
+                (
+                    topic, key, subject.strip(), fact.strip(), source_url,
+                    len(tokens), now_iso(), now_iso(), expires,
+                ),
+            )
+            mem_id = int(cur.lastrowid)
+            conn.executemany(
+                "INSERT OR IGNORE INTO memory_index(token, memory_id) VALUES(?,?)",
+                [(t, mem_id) for t in tokens],
+            )
+        return True
+
+    def recall(
+        self, text: str, limit: int = 8, today: Optional[str] = None
+    ) -> list[sqlite3.Row]:
+        """Return memory entries whose subject tokens appear in `text`.
+
+        This is the "index" that keeps prompts small: instead of loading all
+        memory, we look up only entries overlapping the text at hand, ranked by
+        how much of their subject matched. Entries whose subject has 2+ tokens
+        need 2+ matches (so a lone generic word like "ultra" can't drag one in).
+        """
+        tokens = memory_tokens(text)
+        if not tokens:
+            return []
+        day = today or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        placeholders = ",".join("?" * len(tokens))
+        rows = self.conn.execute(
+            f"SELECT m.*, COUNT(*) AS matched FROM memory m "
+            f"JOIN memory_index i ON i.memory_id = m.id "
+            f"WHERE i.token IN ({placeholders}) "
+            f"AND (m.expires_at IS NULL OR m.expires_at >= ?) "
+            f"GROUP BY m.id "
+            f"HAVING matched >= MIN(2, m.token_count) "
+            f"ORDER BY matched DESC, m.last_seen_at DESC LIMIT ?",
+            (*tokens, day, limit),
+        ).fetchall()
+        return rows
+
+    def list_memory(
+        self, topic: Optional[str] = None, query: str = "", limit: int = 100
+    ) -> list[sqlite3.Row]:
+        sql = "SELECT * FROM memory WHERE 1=1"
+        params: list = []
+        if topic:
+            sql += " AND topic=?"
+            params.append(topic)
+        if query:
+            sql += " AND (subject LIKE ? OR fact LIKE ?)"
+            params += [f"%{query}%", f"%{query}%"]
+        sql += " ORDER BY last_seen_at DESC LIMIT ?"
+        params.append(limit)
+        return self.conn.execute(sql, params).fetchall()
+
+    def forget_memory(self, memory_id: int) -> bool:
+        with self.tx() as conn:
+            conn.execute("DELETE FROM memory_index WHERE memory_id=?", (memory_id,))
+            return conn.execute(
+                "DELETE FROM memory WHERE id=?", (memory_id,)
+            ).rowcount > 0
+
+    def purge_expired_memory(self, today: Optional[str] = None) -> int:
+        day = today or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        with self.tx() as conn:
+            ids = [
+                r["id"]
+                for r in conn.execute(
+                    "SELECT id FROM memory WHERE expires_at IS NOT NULL AND expires_at < ?",
+                    (day,),
+                ).fetchall()
+            ]
+            if not ids:
+                return 0
+            qs = ",".join("?" * len(ids))
+            conn.execute(f"DELETE FROM memory_index WHERE memory_id IN ({qs})", ids)
+            conn.execute(f"DELETE FROM memory WHERE id IN ({qs})", ids)
+        return len(ids)
+
     # --- Maintenance / status ------------------------------------------
 
     def purge_old_raw_items(self, before_iso: str) -> int:
@@ -598,6 +766,7 @@ class Store:
             "suggestions_pending": n(
                 "SELECT COUNT(*) FROM suggestions WHERE status='pending'"
             ),
+            "memory_entries": n("SELECT COUNT(*) FROM memory"),
             "races_tr": n("SELECT COUNT(*) FROM races WHERE is_tr=1"),
             "races_tr_upcoming": n(
                 "SELECT COUNT(*) FROM races WHERE is_tr=1 AND status='upcoming'"
