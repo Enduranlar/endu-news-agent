@@ -33,6 +33,11 @@ log = logging.getLogger("agent.llm")
 # but large enough to amortize the shared interest-list prompt prefix.
 SCORE_BATCH_SIZE = 8
 
+# max_tokens is a ceiling, not a spend: you're billed for tokens actually
+# generated. Reasoning models burn hundreds of tokens before emitting content, so
+# these are set with headroom rather than trimmed to the expected output size.
+MAX_TOKENS_CEILING = 16000
+
 
 @dataclass
 class ScoreResult:
@@ -155,6 +160,33 @@ _DEDUPE_SCHEMA: dict[str, Any] = {
 }
 
 
+def _openrouter_error(resp: "httpx.Response") -> str:
+    """Pull the useful sentence out of an OpenRouter error.
+
+    Provider errors arrive nested (error.metadata.raw is itself JSON), so the
+    actionable part — e.g. "model features structured outputs not support" — is
+    otherwise buried in escaped JSON."""
+    try:
+        err = (resp.json() or {}).get("error") or {}
+    except ValueError:
+        return resp.text[:300]
+    parts = []
+    raw = (err.get("metadata") or {}).get("raw")
+    if raw:
+        try:
+            inner = json.loads(raw) if isinstance(raw, str) else raw
+            if isinstance(inner, dict) and inner.get("message"):
+                parts.append(str(inner["message"]))
+        except (ValueError, TypeError):
+            parts.append(str(raw)[:200])
+    if err.get("message") and not parts:
+        parts.append(str(err["message"]))
+    provider = (err.get("metadata") or {}).get("provider_name")
+    if provider:
+        parts.append(f"(provider: {provider})")
+    return " ".join(parts)[:300] or resp.text[:300]
+
+
 class LLMClient:
     """Model client for one agent.
 
@@ -235,8 +267,11 @@ class LLMClient:
                 data = resp.json()
                 if data.get("error"):
                     raise RuntimeError(f"OpenRouter error: {data['error']}")
-                return (data["choices"][0]["message"]["content"] or ""), (
-                    data.get("usage") or {}
+                choice = data["choices"][0]
+                return (
+                    choice["message"].get("content") or "",
+                    data.get("usage") or {},
+                    choice.get("finish_reason") or "",
                 )
             if resp.status_code in (429, 500, 502, 503, 504):
                 last = RuntimeError(f"{resp.status_code}: {resp.text[:200]}")
@@ -247,15 +282,46 @@ class LLMClient:
                     delay = 1.5 * (2**attempt)
                 time.sleep(min(30.0, delay))
                 continue
-            raise RuntimeError(f"OpenRouter {resp.status_code}: {resp.text[:300]}")
+            raise RuntimeError(
+                f"OpenRouter {resp.status_code}: {_openrouter_error(resp)}"
+            )
         raise RuntimeError(f"OpenRouter request failed after retries: {last}")
+
+    def _openrouter_complete(
+        self, model: str, prompt: str, max_tokens: int, schema: Optional[dict],
+        call_type: str,
+    ) -> str:
+        """One OpenRouter call, retried once with a bigger budget if the model
+        spent it all on reasoning.
+
+        Reasoning models (Kimi, o-series, …) emit hundreds of thinking tokens
+        before any content. If max_tokens is too small the answer is empty with
+        finish_reason='length' — which looks like a broken model but is just a
+        starved budget. max_tokens is a cap, not a spend, so retrying bigger is
+        cheap and only affects models that actually need it."""
+        text, usage, finish = self._openrouter_call(model, prompt, max_tokens, schema)
+        self._record(call_type, model, usage)
+        if text.strip() or finish != "length":
+            return text
+        bigger = min(max_tokens * 4, MAX_TOKENS_CEILING)
+        if bigger <= max_tokens:
+            return text
+        log.warning(
+            "%s: %s used its whole %d-token budget on reasoning; retrying with %d "
+            "(raise max tokens for this model to avoid the double call)",
+            call_type, model, max_tokens, bigger,
+        )
+        text, usage, _ = self._openrouter_call(model, prompt, bigger, schema)
+        self._record(call_type, model, usage)
+        return text
 
     def _complete_json(self, prompt: str, schema: dict, max_tokens: int,
                        call_type: str, model: Optional[str] = None) -> dict:
         model = model or self.filter_model
         if self.provider == "openrouter":
-            text, usage = self._openrouter_call(model, prompt, max_tokens, schema)
-            self._record(call_type, model, usage)
+            text = self._openrouter_complete(
+                model, prompt, max_tokens, schema, call_type
+            )
             return self._parse_json(text)
         resp = self.client.messages.create(
             model=model, max_tokens=max_tokens,
@@ -269,9 +335,9 @@ class LLMClient:
                        model: Optional[str] = None) -> str:
         model = model or self.summary_model
         if self.provider == "openrouter":
-            text, usage = self._openrouter_call(model, prompt, max_tokens, None)
-            self._record(call_type, model, usage)
-            return text
+            return self._openrouter_complete(
+                model, prompt, max_tokens, None, call_type
+            )
         resp = self.client.messages.create(
             model=model, max_tokens=max_tokens,
             messages=[{"role": "user", "content": prompt}],
@@ -348,7 +414,7 @@ class LLMClient:
         )
 
         try:
-            data = self._complete_json(prompt, schema, 2000, "score")
+            data = self._complete_json(prompt, schema, 6000, "score")
             return self._align_results(data, len(items), interests)
         except Exception as exc:  # noqa: BLE001 — degrade gracefully, never crash a run
             log.warning("score_items batch failed (%s); marking batch not-relevant", exc)
@@ -450,7 +516,7 @@ class LLMClient:
             "göründüğüne dair kısa bir not, TÜRKÇE)."
         )
         try:
-            data = self._complete_json(prompt, _VET_SCHEMA, 500, "vet")
+            data = self._complete_json(prompt, _VET_SCHEMA, 2000, "vet")
             return VetResult(
                 on_topic=bool(data.get("on_topic", False)),
                 reason=self._truncate(str(data.get("reason", "")), 200),
@@ -495,7 +561,7 @@ class LLMClient:
             "Tekrar eden madde gruplarının index listelerini döndür."
         )
         try:
-            data = self._complete_json(prompt, _DEDUPE_SCHEMA, 1500, "dedupe")
+            data = self._complete_json(prompt, _DEDUPE_SCHEMA, 4000, "dedupe")
             out: list[list[int]] = []
             for g in data.get("groups", []):
                 idxs = [int(i) for i in g.get("indices", []) if isinstance(i, int)]
@@ -520,7 +586,7 @@ class LLMClient:
         try:
             data = self._complete_json(
                 "Reply with ok=true and word=\"pong\".",
-                _PROBE_SCHEMA, 64, "healthcheck",
+                _PROBE_SCHEMA, 2000, "healthcheck",
             )
             res.structured_ok = isinstance(data.get("ok"), bool)
             if not res.structured_ok:
@@ -528,13 +594,21 @@ class LLMClient:
                     "returned JSON that doesn't match the schema: "
                     f"{str(data)[:120]}"
                 )
-        except json.JSONDecodeError:
-            # Reached the model but got prose back — the usual sign that this
-            # model can't honour a JSON schema, which the pipeline requires.
-            res.error = (
-                "did not return valid JSON — this model probably doesn't support "
-                "structured outputs (required for scoring/memory/vetting)"
-            )
+        except json.JSONDecodeError as exc:
+            # Reached the model but couldn't parse the reply. Empty means the
+            # budget was exhausted (a reasoning model that never got to emit
+            # content); prose means the model ignored the schema.
+            if not str(exc.doc or "").strip():
+                res.error = (
+                    "returned empty content — the model used its whole token "
+                    "budget (a reasoning model?) without answering"
+                )
+            else:
+                res.error = (
+                    "did not return valid JSON — this model probably doesn't "
+                    "support structured outputs (required for "
+                    f"scoring/memory/vetting). Got: {str(exc.doc)[:100]!r}"
+                )
             res.latency_s = time.monotonic() - started
             return res
         except Exception as exc:  # noqa: BLE001 — report, don't raise
@@ -544,7 +618,7 @@ class LLMClient:
 
         if self.summary_model and self.summary_model != self.filter_model:
             try:
-                text = self._complete_text("Say: pong", 32, "healthcheck")
+                text = self._complete_text("Say: pong", 2000, "healthcheck")
                 res.text_ok = bool(text.strip())
                 if not res.text_ok:
                     res.error = "summary model returned empty text"
@@ -579,7 +653,7 @@ class LLMClient:
             f"YARIŞ: {race_name}\n\nSAYFA METNİ:\n{self._truncate(page_text, 6000)}"
         )
         try:
-            data = self._complete_json(prompt, _RESULTS_SCHEMA, 400, "race_results")
+            data = self._complete_json(prompt, _RESULTS_SCHEMA, 2000, "race_results")
             return RaceResultsExtract(
                 found=bool(data.get("found", False)),
                 summary=self._truncate(str(data.get("summary", "")), 140),
