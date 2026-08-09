@@ -48,9 +48,24 @@ class ReportBundle:
     groups: list[tuple[str, list[ReportItem]]]  # (category label, items)
     upcoming_races: list[dict]
     item_count: int
+    agent: str = ""
+    cost: dict | None = None   # {calls, tokens, cost} since the last report
     categories_covered: list[str] = field(default_factory=list)
     markdown: str = ""
     html: str = ""
+
+    @property
+    def cost_line(self) -> str:
+        """Footer: what producing this report cost (empty when nothing recorded)."""
+        c = self.cost or {}
+        calls = int(c.get("calls") or 0)
+        if not calls:
+            return ""
+        tokens = int(c.get("tokens") or 0)
+        usd = float(c.get("cost") or 0.0)
+        who = f" ({self.agent})" if self.agent else ""
+        cost_txt = f" · ${usd:.4f}" if usd else ""
+        return f"Bu rapor: {calls} çağrı · {tokens:,} token{cost_txt}{who}".replace(",", ".")
 
 
 def _ts_to_date(ts) -> str:
@@ -63,7 +78,11 @@ def _ts_to_date(ts) -> str:
 
 
 def build_report(
-    store: Store, llm: LLMClient, interests: Interests, period: str
+    store: Store,
+    llm: LLMClient,
+    interests: Interests,
+    period: str,
+    agent: str = "",
 ) -> ReportBundle:
     since = store.last_report_sent_at()
     ig_rows, web_rows = store.relevant_items_since(since)
@@ -127,6 +146,9 @@ def build_report(
         f"Dayanıklılık Sporları Haber Özeti — {period_label} brifingi "
         f"({istanbul_short_date_tr(now)})"
     )
+    if agent:
+        # Tag the subject so several agents' reports are distinct in the inbox.
+        title = f"[{agent}] {title}"
 
     intro = _write_intro(llm, period, groups)
 
@@ -139,6 +161,9 @@ def build_report(
         upcoming_races=upcoming_races,
         item_count=len(items),
         categories_covered=covered,
+        agent=agent,
+        # What this report cost to produce: model spend since the previous report.
+        cost=store.cost_since_ts(since),
     )
     bundle.markdown = _render_markdown(bundle)
     bundle.html = _render_html(bundle)
@@ -302,6 +327,12 @@ def _render_markdown(b: ReportBundle) -> str:
             out.append(f"- **{r['date_raw']}** {r['name']}{loc}{dist}{link}")
         out.append("")
 
+    if b.cost_line:
+        out.append("---")
+        out.append("")
+        out.append(f"_{b.cost_line}_")
+        out.append("")
+
     return "\n".join(out)
 
 
@@ -382,7 +413,9 @@ def _render_html(b: ReportBundle) -> str:
         'font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;">'
         f"{inner}"
         '<p style="margin-top:28px;color:#bbb;font-size:11px;border-top:1px solid '
-        '#eee;padding-top:10px;">Bu rapor dayanıklılık haber ajansı tarafından '
-        "otomatik olarak oluşturulmuştur.</p>"
+        '#eee;padding-top:10px;">'
+        f"{_esc(b.cost_line) + '<br>' if b.cost_line else ''}"
+        "Bu rapor dayanıklılık haber ajansı tarafından otomatik olarak "
+        "oluşturulmuştur.</p>"
         "</div></body></html>"
     )

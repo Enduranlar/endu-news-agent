@@ -21,11 +21,12 @@ import logging
 import re
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
-from typing import Optional
+from typing import Callable, Optional
 from urllib.parse import urlparse
 
 from .config_loader import Interests
 from .ingest_web import WebFetcher
+from .llm import LLMClient
 from .llm import LLMClient
 from .sociavault import (
     CreditBudgetExceeded,
@@ -47,6 +48,25 @@ def _strip_www(host: str) -> str:
 
 
 @dataclass
+class Candidate:
+    """A source candidate found in the shared collect phase."""
+
+    kind: str        # 'ig' | 'site'
+    key: str         # handle, or https://host
+    descriptor: str  # blurb handed to each agent's model for vetting
+    signal: str      # follower count / credibility hint
+    via: str         # where it was discovered
+
+
+@dataclass
+class DiscoveryCandidates:
+    candidates: list[Candidate] = field(default_factory=list)
+    ig_lookups: int = 0
+    search_queries: int = 0
+    budget_hit: bool = False
+
+
+@dataclass
 class DiscoveryResult:
     new_suggestions: int = 0
     ig_lookups: int = 0
@@ -55,170 +75,138 @@ class DiscoveryResult:
     candidates_seen: int = 0
 
 
-def run_discovery(
-    store: Store,
+def collect_candidates(
     sv: SociaVaultClient,
     fetcher: WebFetcher,
-    llm: LLMClient,
     interests: Interests,
     related: list[tuple[str, RelatedAccount]],
+    known_handles: set[str],
+    known_hosts: set[str],
+    skip: Callable[[str, str], bool],
     max_ig_lookups: int = 12,
     max_search_queries: int = 3,
-) -> DiscoveryResult:
-    result = DiscoveryResult()
+) -> DiscoveryCandidates:
+    """Gather source candidates ONCE per run (the SociaVault-metered part).
 
-    active_handles = {s["key"].lower() for s in store.active_sources("ig")}
-    active_hosts = _active_hosts(store)
+    `skip(kind, key)` is True for candidates already tracked or already decided
+    on, so we don't spend credits re-checking them. Vetting is left to each agent
+    (see vet_candidates) so different models can disagree."""
+    res = DiscoveryCandidates()
+    seen_handles: set[str] = set()
+
+    def add_ig(handle: str, via: str) -> None:
+        if res.ig_lookups >= max_ig_lookups or res.budget_hit:
+            return
+        if handle in seen_handles or handle in known_handles or skip("ig", handle):
+            return
+        seen_handles.add(handle)
+        try:
+            profile = sv.get_instagram_profile(handle)
+        except CreditBudgetExceeded:
+            log.warning("credit budget reached vetting IG candidate @%s", handle)
+            res.budget_hit = True
+            return
+        except SociaVaultError as exc:
+            log.debug("IG candidate lookup failed for @%s: %s", handle, exc)
+            return
+        res.ig_lookups += 1
+        res.candidates.append(Candidate(
+            kind="ig", key=handle,
+            descriptor=(
+                f"Instagram @{profile.username} ({profile.full_name}). "
+                f"{profile.followers} followers"
+                + (", verified" if profile.is_verified else "")
+                + (f". Category: {profile.business_category}"
+                   if profile.business_category else "")
+                + f". Bio: {profile.biography}"
+            ),
+            signal=f"{profile.followers} followers",
+            via=f"IG related to {via}",
+        ))
 
     # --- Stream 1: IG related accounts ---------------------------------
-    seen_handles: set[str] = set()
     for via, ra in related:
-        if result.ig_lookups >= max_ig_lookups:
-            break
-        handle = ra.handle.lower()
-        if (
-            handle in seen_handles
-            or handle in active_handles
-            or store.is_dismissed_or_tracked("ig", handle)
-        ):
-            continue
-        seen_handles.add(handle)
-        result.candidates_seen += 1
-        if _vet_ig_candidate(
-            store, sv, llm, interests, handle, via, result
-        ) is False and result.budget_hit:
-            break
+        add_ig(ra.handle.lower(), via)
 
     # --- Stream 2: web search ------------------------------------------
-    queries = _build_queries(interests, max_search_queries)
-    for query in queries:
-        if result.budget_hit:
+    for query in _build_queries(interests, max_search_queries):
+        if res.budget_hit:
             break
         try:
             results = sv.google_search(query)
         except CreditBudgetExceeded:
             log.warning("credit budget reached during web-search discovery")
-            result.budget_hit = True
+            res.budget_hit = True
             break
         except SociaVaultError as exc:
             log.error("google_search failed for %r: %s", query, exc)
             continue
-        result.search_queries += 1
+        res.search_queries += 1
 
         for sr in results:
-            host = _strip_www((urlparse(sr.url).hostname or "").lower())
-            # IG handles surfaced in search results.
             m = _IG_URL_RE.search(sr.url)
             if m:
                 handle = m.group(1).lower().strip("/")
-                if (
-                    handle
-                    and handle not in _IG_RESERVED
-                    and handle not in active_handles
-                    and not store.is_dismissed_or_tracked("ig", handle)
-                    and result.ig_lookups < max_ig_lookups
-                ):
-                    result.candidates_seen += 1
-                    _vet_ig_candidate(
-                        store, sv, llm, interests, handle, "web search", result
-                    )
+                if handle and handle not in _IG_RESERVED:
+                    add_ig(handle, "web search")
                 continue
 
-            # Website candidates.
-            if not host or _is_excluded_host(host):
+            host = _strip_www((urlparse(sr.url).hostname or "").lower())
+            if not host or _is_excluded_host(host) or host in known_hosts:
                 continue
             key = f"https://{host}"
-            if host in active_hosts or store.is_dismissed_or_tracked("site", key):
+            if skip("site", key):
                 continue
-            active_hosts.add(host)  # don't re-vet same host twice this run
-            result.candidates_seen += 1
-            _vet_site_candidate(
-                store, fetcher, llm, interests, host, key, sr, query, result
-            )
+            known_hosts.add(host)  # don't re-collect the same host this run
+            title, description = _homepage_meta(fetcher, key)
+            res.candidates.append(Candidate(
+                kind="site", key=key,
+                descriptor=(
+                    f"Website {host}. Title: {title or sr.title}. "
+                    f"Description: {description or sr.snippet}. "
+                    f"(Found via search query: {query!r})"
+                ),
+                signal="", via=f"web search: {query!r}",
+            ))
 
     log.info(
-        "Discovery: %d candidates, %d ig lookups, %d queries, %d new suggestions%s",
-        result.candidates_seen,
-        result.ig_lookups,
-        result.search_queries,
-        result.new_suggestions,
-        " (budget hit)" if result.budget_hit else "",
+        "Discovery collect: %d candidates (%d ig lookups, %d queries)%s",
+        len(res.candidates), res.ig_lookups, res.search_queries,
+        " (budget hit)" if res.budget_hit else "",
     )
-    return result
+    return res
 
 
-def _vet_ig_candidate(
-    store: Store,
-    sv: SociaVaultClient,
-    llm: LLMClient,
-    interests: Interests,
-    handle: str,
-    via: str,
-    result: DiscoveryResult,
-) -> Optional[bool]:
-    try:
-        profile = sv.get_instagram_profile(handle)
-    except CreditBudgetExceeded:
-        log.warning("credit budget reached vetting IG candidate @%s", handle)
-        result.budget_hit = True
-        return False
-    except SociaVaultError as exc:
-        log.debug("IG candidate lookup failed for @%s: %s", handle, exc)
-        return None
-    result.ig_lookups += 1
-
-    descriptor = (
-        f"Instagram @{profile.username} ({profile.full_name}). "
-        f"{profile.followers} followers"
-        + (", verified" if profile.is_verified else "")
-        + (f". Category: {profile.business_category}" if profile.business_category else "")
-        + f". Bio: {profile.biography}"
+def vet_candidates(store: Store, llm: LLMClient, interests: Interests,
+                   collected: DiscoveryCandidates) -> DiscoveryResult:
+    """Vet shared candidates with THIS agent's model and queue its suggestions."""
+    res = DiscoveryResult(
+        ig_lookups=collected.ig_lookups,
+        search_queries=collected.search_queries,
+        budget_hit=collected.budget_hit,
+        candidates_seen=len(collected.candidates),
     )
-    verdict = llm.vet_source(descriptor, interests)
-    if verdict and verdict.on_topic:
-        added = store.add_suggestion(
-            kind="ig",
-            key=handle,
-            reason=verdict.reason,
-            signal=f"{profile.followers} followers — {verdict.credibility}",
-            discovered_via=f"IG related to {via}",
-        )
-        if added:
-            result.new_suggestions += 1
-    return None
+    for cand in collected.candidates:
+        if store.is_dismissed_or_tracked(cand.kind, cand.key):
+            continue
+        verdict = llm.vet_source(cand.descriptor, interests)
+        if not (verdict and verdict.on_topic):
+            continue
+        signal = " — ".join(x for x in (cand.signal, verdict.credibility) if x)
+        if store.add_suggestion(
+            kind=cand.kind, key=cand.key, reason=verdict.reason,
+            signal=signal, discovered_via=cand.via,
+        ):
+            res.new_suggestions += 1
+    log.debug("Discovery vet: %d new suggestions", res.new_suggestions)
+    return res
 
 
-def _vet_site_candidate(
-    store: Store,
-    fetcher: WebFetcher,
-    llm: LLMClient,
-    interests: Interests,
-    host: str,
-    key: str,
-    sr,
-    query: str,
-    result: DiscoveryResult,
-) -> None:
-    title, description = _homepage_meta(fetcher, key)
-    descriptor = (
-        f"Website {host}. Title: {title or sr.title}. "
-        f"Description: {description or sr.snippet}. "
-        f"(Found via search query: {query!r})"
-    )
-    verdict = llm.vet_source(descriptor, interests)
-    if verdict and verdict.on_topic:
-        added = store.add_suggestion(
-            kind="site",
-            key=key,
-            reason=verdict.reason,
-            signal=verdict.credibility,
-            discovered_via=f"web search: {query!r}",
-        )
-        if added:
-            result.new_suggestions += 1
+def active_handles(store: Store) -> set[str]:
+    return {s["key"].lower() for s in store.active_sources("ig")}
 
 
-def _active_hosts(store: Store) -> set[str]:
+def active_hosts(store: Store) -> set[str]:
     hosts: set[str] = set()
     for kind in ("rss", "site"):
         for s in store.active_sources(kind):

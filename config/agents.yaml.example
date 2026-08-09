@@ -1,0 +1,49 @@
+# Agent fleet — run the SAME pipeline with different models, side by side.
+#
+# Every agent shares the expensive/curated stuff: SociaVault calls and web fetches
+# happen ONCE per run (credits are spent once), and all agents read the same
+# igaccounts.md / websites.md / interests.yaml / memory.yaml. What differs per
+# agent is the model — and therefore its database, memory, suggestions, reports,
+# and cost.
+#
+# SETUP: copy this file to `agents.yaml` (or put it in $AGENT_STATE_DIR/config/):
+#
+#   cp config/agents.yaml.example config/agents.yaml
+#
+# Delete the file to go back to single-agent mode: the agent then uses the legacy
+# paths (data/agent.db, reports/) and the models from .env — nothing changes.
+#
+# Per agent:
+#   data/agents/<name>.db      state, memory, suggestions, cost
+#   reports/<name>/<YYYY>/...  archived reports (+ its own index)
+# and one email per agent, subject-tagged with the agent name.
+#
+# `model` strings are OpenRouter model ids (https://openrouter.ai/models) when
+# OPENROUTER_API_KEY is set. With `provider: anthropic` they are Anthropic model
+# ids instead, so you can keep one agent on the direct Anthropic API.
+
+agents:
+  - name: haiku
+    # Cheap/fast filter model — used for relevance, memory, vetting, race results.
+    model: anthropic/claude-haiku-4.5
+    # Stronger model for writing the report intro. Defaults to `model` if omitted.
+    summary_model: anthropic/claude-sonnet-4.6
+    enabled: true
+    # The primary agent decides which agent's "already fetched" state gates
+    # article downloads. Exactly one agent should be primary; the first enabled
+    # agent is used if none is marked.
+    primary: true
+
+  - name: gemini-flash
+    model: google/gemini-2.5-flash
+    enabled: true
+
+  - name: gpt5-mini
+    model: openai/gpt-5-mini
+    enabled: true
+
+  # Disabled agents are skipped entirely (no cost). Handy for parking a model
+  # without deleting its history.
+  - name: qwen
+    model: qwen/qwen3-max
+    enabled: false

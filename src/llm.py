@@ -1,4 +1,9 @@
-"""Anthropic LLM wrapper: relevance scoring, source vetting, summary writing.
+"""LLM wrapper: relevance scoring, memory, source vetting, summary writing.
+
+Two providers behind one interface — OpenRouter (recommended: many models via one
+key, and it returns the real per-call cost, which we log for the cost report) and
+the direct Anthropic API. Each agent in the fleet gets its own client, so several
+models can run the same pipeline side by side.
 
 Two models per the brief: a cheap/fast filter model (default claude-haiku-4-5)
 for per-item relevance + categorization and source vetting, and a stronger model
@@ -13,10 +18,12 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
 import anthropic
+import httpx
 
 from .config_loader import Interests, MemoryConfig
 
@@ -130,11 +137,137 @@ _DEDUPE_SCHEMA: dict[str, Any] = {
 
 
 class LLMClient:
-    def __init__(self, api_key: str, filter_model: str, summary_model: str):
-        # Direct client — no proxy. The SDK auto-retries 429/5xx with backoff.
-        self.client = anthropic.Anthropic(api_key=api_key, max_retries=3)
+    """Model client for one agent.
+
+    provider="openrouter" (recommended) uses OpenAI-compatible chat completions:
+    many models under one key, and the response carries the real cost, which we
+    log. provider="anthropic" uses the direct API — tokens are logged but cost
+    stays 0 (the API doesn't return a price).
+
+    Both go DIRECT — never through the Turkish proxy. When `store` is given, every
+    call is recorded to llm_usage for the cost report.
+    """
+
+    def __init__(self, api_key: str, filter_model: str, summary_model: str,
+                 provider: str = "anthropic", base_url: str = "",
+                 store: Any = None, agent: str = ""):
+        self.provider = provider or "anthropic"
         self.filter_model = filter_model
         self.summary_model = summary_model
+        self.store = store
+        self.agent = agent
+        self.client = None
+        self._http = None
+        if self.provider == "openrouter":
+            self._http = httpx.Client(
+                base_url=base_url or "https://openrouter.ai/api/v1",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                    "X-Title": "endu-news-agent",
+                },
+                timeout=httpx.Timeout(connect=10.0, read=180.0, write=30.0, pool=10.0),
+            )
+        else:
+            # SDK auto-retries 429/5xx with backoff.
+            self.client = anthropic.Anthropic(api_key=api_key, max_retries=3)
+
+    def close(self) -> None:
+        if self._http is not None:
+            self._http.close()
+
+    # --- Provider plumbing ---------------------------------------------
+
+    def _record(self, call_type: str, model: str, usage: dict) -> None:
+        if self.store is None:
+            return
+        try:
+            self.store.record_llm_usage(
+                agent=self.agent, model=model, call_type=call_type,
+                prompt_tokens=int(usage.get("prompt_tokens") or 0),
+                completion_tokens=int(usage.get("completion_tokens") or 0),
+                cost_usd=float(usage.get("cost") or 0.0),
+            )
+        except Exception as exc:  # noqa: BLE001 — accounting never breaks a run
+            log.warning("failed to record llm usage (%s)", exc)
+
+    def _openrouter_call(self, model: str, prompt: str, max_tokens: int,
+                         schema: Optional[dict]) -> tuple[str, dict]:
+        body: dict[str, Any] = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+            "usage": {"include": True},   # ask for the real cost of this call
+        }
+        if schema is not None:
+            body["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {"name": "result", "strict": True, "schema": schema},
+            }
+        last: Optional[Exception] = None
+        for attempt in range(4):
+            try:
+                resp = self._http.post("/chat/completions", json=body)
+            except httpx.HTTPError as exc:
+                last = exc
+                time.sleep(min(30.0, 1.5 * (2**attempt)))
+                continue
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("error"):
+                    raise RuntimeError(f"OpenRouter error: {data['error']}")
+                return (data["choices"][0]["message"]["content"] or ""), (
+                    data.get("usage") or {}
+                )
+            if resp.status_code in (429, 500, 502, 503, 504):
+                last = RuntimeError(f"{resp.status_code}: {resp.text[:200]}")
+                ra = resp.headers.get("retry-after")
+                try:
+                    delay = float(ra) if ra else 1.5 * (2**attempt)
+                except ValueError:
+                    delay = 1.5 * (2**attempt)
+                time.sleep(min(30.0, delay))
+                continue
+            raise RuntimeError(f"OpenRouter {resp.status_code}: {resp.text[:300]}")
+        raise RuntimeError(f"OpenRouter request failed after retries: {last}")
+
+    def _complete_json(self, prompt: str, schema: dict, max_tokens: int,
+                       call_type: str, model: Optional[str] = None) -> dict:
+        model = model or self.filter_model
+        if self.provider == "openrouter":
+            text, usage = self._openrouter_call(model, prompt, max_tokens, schema)
+            self._record(call_type, model, usage)
+            return self._parse_json(text)
+        resp = self.client.messages.create(
+            model=model, max_tokens=max_tokens,
+            messages=[{"role": "user", "content": prompt}],
+            output_config={"format": {"type": "json_schema", "schema": schema}},
+        )
+        self._record(call_type, model, self._anthropic_usage(resp))
+        return self._parse_json(self._extract_text(resp))
+
+    def _complete_text(self, prompt: str, max_tokens: int, call_type: str,
+                       model: Optional[str] = None) -> str:
+        model = model or self.summary_model
+        if self.provider == "openrouter":
+            text, usage = self._openrouter_call(model, prompt, max_tokens, None)
+            self._record(call_type, model, usage)
+            return text
+        resp = self.client.messages.create(
+            model=model, max_tokens=max_tokens,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        self._record(call_type, model, self._anthropic_usage(resp))
+        return self._extract_text(resp)
+
+    @staticmethod
+    def _anthropic_usage(resp: Any) -> dict:
+        u = getattr(resp, "usage", None)
+        return {
+            "prompt_tokens": getattr(u, "input_tokens", 0) or 0,
+            "completion_tokens": getattr(u, "output_tokens", 0) or 0,
+            "cost": 0.0,   # the Anthropic API doesn't return a price
+        }
 
     # --- Relevance scoring ---------------------------------------------
 
@@ -196,15 +329,7 @@ class LLMClient:
         )
 
         try:
-            resp = self.client.messages.create(
-                model=self.filter_model,
-                max_tokens=2000,
-                messages=[{"role": "user", "content": prompt}],
-                output_config={
-                    "format": {"type": "json_schema", "schema": schema}
-                },
-            )
-            data = self._extract_json(resp)
+            data = self._complete_json(prompt, schema, 2000, "score")
             return self._align_results(data, len(items), interests)
         except Exception as exc:  # noqa: BLE001 — degrade gracefully, never crash a run
             log.warning("score_items batch failed (%s); marking batch not-relevant", exc)
@@ -306,15 +431,7 @@ class LLMClient:
             "göründüğüne dair kısa bir not, TÜRKÇE)."
         )
         try:
-            resp = self.client.messages.create(
-                model=self.filter_model,
-                max_tokens=500,
-                messages=[{"role": "user", "content": prompt}],
-                output_config={
-                    "format": {"type": "json_schema", "schema": _VET_SCHEMA}
-                },
-            )
-            data = self._extract_json(resp)
+            data = self._complete_json(prompt, _VET_SCHEMA, 500, "vet")
             return VetResult(
                 on_topic=bool(data.get("on_topic", False)),
                 reason=self._truncate(str(data.get("reason", "")), 200),
@@ -359,15 +476,7 @@ class LLMClient:
             "Tekrar eden madde gruplarının index listelerini döndür."
         )
         try:
-            resp = self.client.messages.create(
-                model=self.filter_model,
-                max_tokens=1500,
-                messages=[{"role": "user", "content": prompt}],
-                output_config={
-                    "format": {"type": "json_schema", "schema": _DEDUPE_SCHEMA}
-                },
-            )
-            data = self._extract_json(resp)
+            data = self._complete_json(prompt, _DEDUPE_SCHEMA, 1500, "dedupe")
             out: list[list[int]] = []
             for g in data.get("groups", []):
                 idxs = [int(i) for i in g.get("indices", []) if isinstance(i, int)]
@@ -398,15 +507,7 @@ class LLMClient:
             f"YARIŞ: {race_name}\n\nSAYFA METNİ:\n{self._truncate(page_text, 6000)}"
         )
         try:
-            resp = self.client.messages.create(
-                model=self.filter_model,
-                max_tokens=400,
-                messages=[{"role": "user", "content": prompt}],
-                output_config={
-                    "format": {"type": "json_schema", "schema": _RESULTS_SCHEMA}
-                },
-            )
-            data = self._extract_json(resp)
+            data = self._complete_json(prompt, _RESULTS_SCHEMA, 400, "race_results")
             return RaceResultsExtract(
                 found=bool(data.get("found", False)),
                 summary=self._truncate(str(data.get("summary", "")), 140),
@@ -419,12 +520,7 @@ class LLMClient:
 
     def write_summary(self, prompt: str) -> str:
         """Generate the twice-weekly brief with the stronger model. Returns Markdown."""
-        resp = self.client.messages.create(
-            model=self.summary_model,
-            max_tokens=4000,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return self._extract_text(resp).strip()
+        return self._complete_text(prompt, 4000, "summary").strip()
 
     # --- Helpers --------------------------------------------------------
 
@@ -439,8 +535,8 @@ class LLMClient:
             block.text for block in resp.content if getattr(block, "type", "") == "text"
         )
 
-    def _extract_json(self, resp: Any) -> dict:
-        text = self._extract_text(resp).strip()
+    def _parse_json(self, text: str) -> dict:
+        text = (text or "").strip()
         # output_config.format guarantees the first text block is valid JSON, but
         # be defensive: strip code fences if a model ever wraps it.
         if text.startswith("```"):

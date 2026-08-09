@@ -35,7 +35,9 @@ IG_ACCOUNTS_FILE = CONFIG_DIR / "igaccounts.md"
 WEBSITES_FILE = CONFIG_DIR / "websites.md"
 INTERESTS_FILE = CONFIG_DIR / "interests.yaml"
 MEMORY_FILE = CONFIG_DIR / "memory.yaml"
-DB_FILE = DATA_DIR / "agent.db"
+AGENTS_FILE = CONFIG_DIR / "agents.yaml"
+DB_FILE = DATA_DIR / "agent.db"                 # legacy single-agent DB
+SHARED_DB_FILE = DATA_DIR / "shared.db"        # global: SociaVault credits + fetch dedup
 LOG_FILE = LOGS_DIR / "agent.log"
 
 
@@ -91,6 +93,10 @@ class Settings:
     report_from: str
     report_to: list[str] = field(default_factory=list)
 
+    # OpenRouter (optional; preferred when set — many models + real cost reporting)
+    openrouter_api_key: str = ""
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
+
     # Behaviour knobs
     ingest_since_date: str = ""  # 'YYYY-MM-DD' floor; items before it are ignored
     ig_first_run_limit: int = 6
@@ -101,6 +107,17 @@ class Settings:
     @property
     def has_proxy(self) -> bool:
         return bool(self.outbound_proxy_url)
+
+    @property
+    def default_provider(self) -> str:
+        return "openrouter" if self.openrouter_api_key else "anthropic"
+
+    def api_key_for(self, provider: str) -> str:
+        return (
+            self.openrouter_api_key
+            if provider == "openrouter"
+            else self.anthropic_api_key
+        )
 
 
 def load_settings(require_email: bool = True, require_llm: bool = True) -> Settings:
@@ -113,10 +130,13 @@ def load_settings(require_email: bool = True, require_llm: bool = True) -> Setti
 
     sociavault_api_key = _require("SOCIAVAULT_API_KEY")
 
-    if require_llm:
-        anthropic_api_key = _require("ANTHROPIC_API_KEY")
-    else:
-        anthropic_api_key = _optional("ANTHROPIC_API_KEY")
+    anthropic_api_key = _optional("ANTHROPIC_API_KEY")
+    openrouter_api_key = _optional("OPENROUTER_API_KEY")
+    if require_llm and not (openrouter_api_key or anthropic_api_key):
+        raise ConfigError(
+            "No LLM credentials: set OPENROUTER_API_KEY (recommended — many models "
+            "+ cost accounting) or ANTHROPIC_API_KEY in .env."
+        )
 
     if require_email:
         smtp_host = _require("SMTP_HOST")
@@ -150,6 +170,10 @@ def load_settings(require_email: bool = True, require_llm: bool = True) -> Setti
         anthropic_api_key=anthropic_api_key,
         llm_filter_model=_optional("LLM_FILTER_MODEL", "claude-haiku-4-5"),
         llm_summary_model=_optional("LLM_SUMMARY_MODEL", "claude-sonnet-4-6"),
+        openrouter_api_key=openrouter_api_key,
+        openrouter_base_url=_optional(
+            "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"
+        ),
         outbound_proxy_url=_optional("OUTBOUND_PROXY_URL"),
         smtp_host=smtp_host,
         smtp_port=_int("SMTP_PORT", 587),

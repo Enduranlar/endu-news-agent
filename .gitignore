@@ -8,6 +8,7 @@ config/igaccounts.md
 config/websites.md
 config/interests.yaml
 config/memory.yaml
+config/agents.yaml
 
 # State + logs
 data/*.db

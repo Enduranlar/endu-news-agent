@@ -26,7 +26,7 @@ import feedparser
 import httpx
 import trafilatura
 
-from .store import Store
+from .store import Store, url_hash
 
 log = logging.getLogger("agent.ingest_web")
 
@@ -71,6 +71,17 @@ _NON_ARTICLE_SEGMENTS = {
     "wp-login",
     "wp-admin",
 }
+
+
+@dataclass
+class CollectedWebItem:
+    """One article fetched in the shared collect phase, fanned out to all agents."""
+
+    source_key: str      # the feed/site url it came from
+    url: str
+    title: str
+    text: str
+    published_at: str
 
 
 @dataclass
@@ -187,138 +198,121 @@ class WebFetcher:
         return None
 
 
-def ingest_web(
-    store: Store,
+def collect_web(
     fetcher: WebFetcher,
+    web_sources,
+    shared: Store,
     web_first_run_limit: int = 6,
     site_max_new_per_run: int = 15,
     since_ts: int | None = None,
-) -> WebIngestResult:
-    result = WebIngestResult()
-    for src in store.active_sources("rss"):
-        result.rss_sources += 1
-        new, skipped = _ingest_rss(
-            store, fetcher, src, first_run_limit=web_first_run_limit, since_ts=since_ts
-        )
-        result.new_items += new
-        result.skipped_old += skipped
-    for src in store.active_sources("site"):
-        result.site_sources += 1
-        result.new_items += _ingest_site(
-            store, fetcher, src, max_new=site_max_new_per_run
-        )
+) -> list[CollectedWebItem]:
+    """Fetch feeds/sites ONCE per run and return the new items for all agents.
+
+    Article bodies are downloaded only for URLs the shared store hasn't seen, so
+    running N agents doesn't multiply web traffic. Agents added later start from
+    the items collected after they join."""
+    out: list[CollectedWebItem] = []
+    rss = [s for s in web_sources if s.kind == "rss"]
+    sites = [s for s in web_sources if s.kind == "site"]
+
+    for src in rss:
+        out.extend(_collect_rss(fetcher, src.url, shared, web_first_run_limit, since_ts))
+    for src in sites:
+        out.extend(_collect_site(fetcher, src.url, shared, site_max_new_per_run))
+
     log.info(
-        "Web ingest: %d rss, %d site, %d new items, %d skipped (before cutoff)",
-        result.rss_sources,
-        result.site_sources,
-        result.new_items,
-        result.skipped_old,
+        "Web collect: %d rss + %d site sources -> %d new items",
+        len(rss), len(sites), len(out),
     )
-    return result
+    return out
 
 
-def _ingest_rss(
-    store: Store, fetcher: WebFetcher, src, first_run_limit: int,
-    since_ts: int | None = None,
-) -> tuple[int, int]:
-    url = src["key"]
+def _collect_rss(fetcher: WebFetcher, url: str, shared: Store,
+                 first_run_limit: int, since_ts: int | None) -> list[CollectedWebItem]:
     raw = fetcher.get_text(url)
     if raw is None:
         log.warning("RSS feed fetch failed: %s", url)
-        return 0, 0
+        return []
     feed = feedparser.parse(raw)
     entries = feed.entries or []
-    first_run = src["last_seen"] is None
-    # The date floor (when set) is the authoritative first-run gate; otherwise
-    # fall back to the most-recent-N limit to avoid backfilling.
-    if first_run and since_ts is None:
+    # "First run" is a property of the whole run, not of one agent.
+    if shared.mark_fetched("feed", url) and since_ts is None:
         entries = entries[:first_run_limit]
 
-    new = 0
-    skipped = 0
-    fetched = 0  # full-page fetches done this run (budget-limited)
+    out: list[CollectedWebItem] = []
+    fetched = 0
     for entry in entries:
         link = entry.get("link")
         if not link:
             continue
-        # Global ingest floor: drop entries dated before the cutoff (cheap check
-        # before fetching/extracting the article).
         if since_ts is not None:
             ets = _entry_ts(entry)
             if ets is not None and ets < since_ts:
-                skipped += 1
                 continue
-        from .store import url_hash
-
-        if store.web_item_exists(url_hash(link)):
-            continue
+        if not shared.mark_fetched("web", url_hash(link)):
+            continue  # already collected in an earlier run
         title = entry.get("title", "")
         published = entry.get("published") or entry.get("updated") or ""
-        # Bound full-page fetches per feed per run (a date-floored first run can
-        # otherwise expand to dozens). Beyond the budget, fall back to the feed's
-        # own summary so the item is still ingested + scorable, just without the
-        # full article text.
         if fetched < RSS_FETCH_BUDGET:
-            text = _extract_article(fetcher, link) or _strip_html(
-                entry.get("summary", "")
-            )
+            text = _extract_article(fetcher, link) or _strip_html(entry.get("summary", ""))
             fetched += 1
             time.sleep(POLITE_DELAY / 2)
         else:
             text = _strip_html(entry.get("summary", ""))
-        item_id = store.insert_web_item(
-            url=link,
-            source_id=src["id"],
-            title=title,
-            text_excerpt=text[:4000],
-            published_at=published,
-        )
-        if item_id:
-            new += 1
+        out.append(CollectedWebItem(
+            source_key=url, url=link, title=title,
+            text=text[:4000], published_at=published,
+        ))
 
     if fetched >= RSS_FETCH_BUDGET:
         log.info(
-            "RSS %s: hit per-run fetch budget (%d); remaining items used feed "
-            "summaries", url, RSS_FETCH_BUDGET,
+            "RSS %s: hit per-run fetch budget (%d); remaining items used feed summaries",
+            url, RSS_FETCH_BUDGET,
         )
-    store.mark_source_run(src["id"], last_seen="seen")
-    return new, skipped
+    return out
 
 
-def _ingest_site(store: Store, fetcher: WebFetcher, src, max_new: int) -> int:
-    base = src["key"]
+def _collect_site(fetcher: WebFetcher, base: str, shared: Store,
+                  max_new: int) -> list[CollectedWebItem]:
     html = fetcher.get_text(base)
     if html is None:
         log.warning("site fetch failed: %s", base)
-        return 0
-
-    candidates = _candidate_article_links(base, html)
-    new = 0
-    for link in candidates:
-        if new >= max_new:
+        return []
+    out: list[CollectedWebItem] = []
+    for link in _candidate_article_links(base, html):
+        if len(out) >= max_new:
             break
-        from .store import url_hash
-
-        if store.web_item_exists(url_hash(link)):
+        if not shared.mark_fetched("web", url_hash(link)):
             continue
         text = _extract_article(fetcher, link)
         if not text or len(text) < 200:
-            # Skip pages that don't extract as real articles.
-            continue
-        title = _first_line(text)
-        item_id = store.insert_web_item(
-            url=link,
-            source_id=src["id"],
-            title=title,
-            text_excerpt=text[:4000],
-            published_at="",
-        )
-        if item_id:
-            new += 1
+            continue  # not a real article
+        out.append(CollectedWebItem(
+            source_key=base, url=link, title=_first_line(text),
+            text=text[:4000], published_at="",
+        ))
         time.sleep(POLITE_DELAY)
+    return out
 
-    store.mark_source_run(src["id"], last_seen="seen")
-    return new
+
+def store_web(store: Store, items: list[CollectedWebItem]) -> WebIngestResult:
+    """Write collected items into one agent's DB (its own dedup)."""
+    res = WebIngestResult()
+    src_ids: dict[str, Optional[int]] = {}
+    for it in items:
+        if it.source_key not in src_ids:
+            row = store.get_source("rss", it.source_key) or store.get_source(
+                "site", it.source_key
+            )
+            src_ids[it.source_key] = row["id"] if row else None
+        if store.insert_web_item(
+            url=it.url, source_id=src_ids[it.source_key], title=it.title,
+            text_excerpt=it.text, published_at=it.published_at,
+        ):
+            res.new_items += 1
+    for src in store.active_sources("rss") + store.active_sources("site"):
+        store.mark_source_run(src["id"], last_seen="seen")
+    return res
 
 
 def _candidate_article_links(base: str, html: str) -> list[str]:
