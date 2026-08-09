@@ -38,6 +38,14 @@ SCORE_BATCH_SIZE = 8
 # these are set with headroom rather than trimmed to the expected output size.
 MAX_TOKENS_CEILING = 16000
 
+# Structured calls (scoring, vetting, dedupe, race results) are classification,
+# not writing: we want the same item to get the same verdict tomorrow that it got
+# today. Providers default to ~1.0, which makes borderline items land on either
+# side of the line run to run — noise that shows up as cross-agent "disagreement"
+# and inflates every comparison statistic. Prose (the report intro) keeps the
+# provider default, where sampling variety is a feature.
+JSON_TEMPERATURE = 0.0
+
 # Some OpenRouter providers (Alibaba/Qwen among them) don't implement full
 # json_schema and silently downgrade the request to OpenAI's `json_object` mode.
 # That mode rejects any request whose messages don't contain the literal word
@@ -253,13 +261,16 @@ class LLMClient:
             log.warning("failed to record llm usage (%s)", exc)
 
     def _openrouter_call(self, model: str, prompt: str, max_tokens: int,
-                         schema: Optional[dict]) -> tuple[str, dict]:
+                         schema: Optional[dict],
+                         temperature: Optional[float] = None) -> tuple[str, dict]:
         body: dict[str, Any] = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": max_tokens,
             "usage": {"include": True},   # ask for the real cost of this call
         }
+        if temperature is not None:
+            body["temperature"] = temperature
         if schema is not None:
             body["response_format"] = {
                 "type": "json_schema",
@@ -299,7 +310,7 @@ class LLMClient:
 
     def _openrouter_complete(
         self, model: str, prompt: str, max_tokens: int, schema: Optional[dict],
-        call_type: str,
+        call_type: str, temperature: Optional[float] = None,
     ) -> str:
         """One OpenRouter call, retried once with a bigger budget if the model
         spent it all on reasoning.
@@ -309,7 +320,9 @@ class LLMClient:
         finish_reason='length' — which looks like a broken model but is just a
         starved budget. max_tokens is a cap, not a spend, so retrying bigger is
         cheap and only affects models that actually need it."""
-        text, usage, finish = self._openrouter_call(model, prompt, max_tokens, schema)
+        text, usage, finish = self._openrouter_call(
+            model, prompt, max_tokens, schema, temperature
+        )
         self._record(call_type, model, usage)
         if text.strip() or finish != "length":
             return text
@@ -321,7 +334,9 @@ class LLMClient:
             "(raise max tokens for this model to avoid the double call)",
             call_type, model, max_tokens, bigger,
         )
-        text, usage, _ = self._openrouter_call(model, prompt, bigger, schema)
+        text, usage, _ = self._openrouter_call(
+            model, prompt, bigger, schema, temperature
+        )
         self._record(call_type, model, usage)
         return text
 
@@ -332,11 +347,13 @@ class LLMClient:
             prompt += _JSON_KEYWORD_HINT
         if self.provider == "openrouter":
             text = self._openrouter_complete(
-                model, prompt, max_tokens, schema, call_type
+                model, prompt, max_tokens, schema, call_type,
+                temperature=JSON_TEMPERATURE,
             )
             return self._parse_json(text)
         resp = self.client.messages.create(
             model=model, max_tokens=max_tokens,
+            temperature=JSON_TEMPERATURE,
             messages=[{"role": "user", "content": prompt}],
             output_config={"format": {"type": "json_schema", "schema": schema}},
         )
