@@ -136,6 +136,7 @@ send.
 | `dismiss --id <n>` | Dismiss a suggestion; it never resurfaces. |
 | `status` | Per-agent counts + **LLM cost**, shared credit spend. `--sources` lists sources. |
 | `memory [--topic X] [--query Q] [--forget ID] [--purge-expired]` | Inspect / prune what the agent remembers. |
+| `test-agents [--agent NAME]` | Check every agent in `agents.yaml` can actually run (tiny live call each). |
 | `test-races [--all] [--limit N]` | Fetch + parse the teamrunbo race calendar (no DB writes). |
 | `test-sociavault --handle <h>` | Live profile call (field-path check). |
 
@@ -292,10 +293,34 @@ ending with what that report cost. Suggestions from every agent land in the same
 which agents proposed each.
 
 ```bash
+python -m src.main test-agents           # verify every agent works (do this first)
 python -m src.main daily                 # all enabled agents
 python -m src.main daily --agent haiku   # just one
 python -m src.main status                # per-agent counts + spend
 ```
+
+### Checking the fleet
+
+After editing `agents.yaml`, verify each agent before trusting a 06:30 cron run:
+
+```bash
+python -m src.main test-agents
+```
+
+```
+[OK  ] haiku         1.2s  $0.00004  openrouter: anthropic/claude-haiku-4.5  +  anthropic/claude-sonnet-4.6
+[FAIL] gemini-flash  0.4s  $0.00000  openrouter: google/gemini-2.5-flashh
+        └─ RuntimeError: OpenRouter 404: No endpoints found for google/gemini-2.5-flashh
+
+1/2 agent(s) OK · check cost $0.00004
+```
+
+It makes **one small live call per model** (fractions of a cent, reported), and
+exercises exactly what the pipeline needs: a JSON-schema **structured** call on
+the filter model plus a text call on the summary model when it differs. It
+**exits non-zero** if any agent fails, so it can gate a deploy. The checks never
+touch the agent databases. Typical failures it catches: a mistyped model id, a
+model that can't do structured outputs, an expired key, or no credit.
 
 **No `agents.yaml` → single-agent mode**, using `data/agent.db`, `reports/`, and
 the models from `.env` — exactly as before.

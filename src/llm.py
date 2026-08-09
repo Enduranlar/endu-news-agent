@@ -54,6 +54,25 @@ class VetResult:
 
 
 @dataclass
+class ProbeResult:
+    """Outcome of a cheap end-to-end health check for one agent."""
+
+    ok: bool = False
+    structured_ok: bool = False
+    text_ok: bool = False
+    latency_s: float = 0.0
+    error: str = ""
+
+
+_PROBE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {"ok": {"type": "boolean"}, "word": {"type": "string"}},
+    "required": ["ok", "word"],
+}
+
+
+@dataclass
 class RaceResultsExtract:
     found: bool
     summary: str  # Turkish, <=140 chars, naming top finishers if present
@@ -486,6 +505,59 @@ class LLMClient:
         except Exception as exc:  # noqa: BLE001 — never fail a report over dedup
             log.warning("find_duplicate_groups failed (%s); keeping all items", exc)
             return []
+
+    # --- Health check ---------------------------------------------------
+
+    def probe(self) -> ProbeResult:
+        """Verify this agent's models actually work, for a fraction of a cent.
+
+        Exercises exactly what the pipeline depends on: a **structured** call on
+        the filter model (JSON schema — relevance, memory, vetting and race
+        results all need it) and a short **text** call on the summary model when
+        it differs. Errors are captured, never raised."""
+        res = ProbeResult()
+        started = time.monotonic()
+        try:
+            data = self._complete_json(
+                "Reply with ok=true and word=\"pong\".",
+                _PROBE_SCHEMA, 64, "healthcheck",
+            )
+            res.structured_ok = isinstance(data.get("ok"), bool)
+            if not res.structured_ok:
+                res.error = (
+                    "returned JSON that doesn't match the schema: "
+                    f"{str(data)[:120]}"
+                )
+        except json.JSONDecodeError:
+            # Reached the model but got prose back — the usual sign that this
+            # model can't honour a JSON schema, which the pipeline requires.
+            res.error = (
+                "did not return valid JSON — this model probably doesn't support "
+                "structured outputs (required for scoring/memory/vetting)"
+            )
+            res.latency_s = time.monotonic() - started
+            return res
+        except Exception as exc:  # noqa: BLE001 — report, don't raise
+            res.error = f"{type(exc).__name__}: {exc}"[:300]
+            res.latency_s = time.monotonic() - started
+            return res
+
+        if self.summary_model and self.summary_model != self.filter_model:
+            try:
+                text = self._complete_text("Say: pong", 32, "healthcheck")
+                res.text_ok = bool(text.strip())
+                if not res.text_ok:
+                    res.error = "summary model returned empty text"
+            except Exception as exc:  # noqa: BLE001
+                res.error = f"summary model — {type(exc).__name__}: {exc}"[:300]
+                res.latency_s = time.monotonic() - started
+                return res
+        else:
+            res.text_ok = True  # same model, already proven above
+
+        res.latency_s = time.monotonic() - started
+        res.ok = res.structured_ok and res.text_ok
+        return res
 
     # --- Race results extraction ---------------------------------------
 

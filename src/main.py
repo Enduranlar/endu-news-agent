@@ -591,6 +591,75 @@ def settings_int_safe(name: str, default: int) -> int:
 # --- test-sociavault (Milestone 1) -------------------------------------------
 
 
+def cmd_test_agents(args: argparse.Namespace) -> int:
+    """Preflight: check every agent in agents.yaml can actually run.
+
+    Makes one tiny real call per model (fractions of a cent) exercising exactly
+    what the pipeline needs — a JSON-schema structured call on the filter model,
+    plus a text call on the summary model when it differs. Exits non-zero if any
+    agent fails, so it can gate a deploy or run from cron."""
+    import time as _time
+    from pathlib import Path
+
+    cfg = settings.load_settings(require_email=False, require_llm=True)
+    agents = load_agents(env_default=(cfg.llm_filter_model, cfg.llm_summary_model))
+    if args.agent:
+        agents = [a for a in agents if a.name in set(args.agent)]
+        if not agents:
+            print("no enabled agent matches " + ", ".join(args.agent), file=sys.stderr)
+            return 1
+
+    # In-memory ledger so the check never writes to the real agent databases.
+    mem = Store(Path(":memory:"))
+
+    print(f"Checking {len(agents)} agent(s) — one small live call per model.\n")
+    rows, failures = [], 0
+    for agent in agents:
+        provider = agent.provider or cfg.default_provider
+        before = float(mem.cost_totals().get("cost") or 0.0)
+        try:
+            llm = _make_llm(cfg, agent, mem)
+        except settings.ConfigError as exc:
+            rows.append((agent, provider, None, 0.0, str(exc)))
+            failures += 1
+            continue
+        try:
+            res = llm.probe()
+        finally:
+            llm.close()
+        cost = float(mem.cost_totals().get("cost") or 0.0) - before
+        rows.append((agent, provider, res, cost, res.error))
+        if not res.ok:
+            failures += 1
+
+    width = max((len(a.name) for a, *_ in rows), default=5)
+    for agent, provider, res, cost, err in rows:
+        mark = "OK  " if (res and res.ok) else "FAIL"
+        models = agent.model
+        if agent.summary_model and agent.summary_model != agent.model:
+            models += f"  +  {agent.summary_model}"
+        timing = f"{res.latency_s:5.1f}s" if res else "    -"
+        print(f"[{mark}] {agent.name:<{width}}  {timing}  ${cost:.5f}  "
+              f"{provider}: {models}")
+        if err:
+            print(f"        └─ {err}")
+        elif res and not res.text_ok:
+            print("        └─ summary model failed")
+
+    total = sum(c for *_, c, _ in rows)
+    print(f"\n{len(rows) - failures}/{len(rows)} agent(s) OK · check cost ${total:.5f}")
+    sys.stdout.flush()
+    if failures:
+        print(
+            "\nCommon causes: a model id that doesn't exist on the provider, a model "
+            "that can't do structured outputs (JSON schema — required), no credit, "
+            "or a missing/invalid API key.",
+            file=sys.stderr,
+        )
+    mem.close()
+    return 1 if failures else 0
+
+
 def cmd_test_races(args: argparse.Namespace) -> int:
     """Fetch the teamrunbo calendar and print parsed TR races (no DB writes)."""
     from .ingest_web import WebFetcher
@@ -724,6 +793,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_stat = sub.add_parser("status", help="print run/credit/cost/DB status")
     p_stat.add_argument("--sources", action="store_true", help="also list sources")
     p_stat.set_defaults(func=cmd_status)
+
+    p_agents = sub.add_parser(
+        "test-agents", help="check every agent in agents.yaml can actually run"
+    )
+    p_agents.add_argument("--agent", action="append", metavar="NAME",
+                          help="check only these agents (repeatable)")
+    p_agents.set_defaults(func=cmd_test_agents)
 
     p_races = sub.add_parser(
         "test-races", help="fetch + parse the teamrunbo race calendar (no DB writes)"
