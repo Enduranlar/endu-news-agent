@@ -18,15 +18,56 @@
 #   reports/<name>/<YYYY>/...  archived reports (+ its own index)
 # and one email per agent, subject-tagged with the agent name.
 #
+# NAMES ARE PERMANENT-ISH: `name` becomes a database filename, a reports
+# directory, and the subject tag on every email that agent sends. Renaming after
+# the first run means moving files and splitting the report history, so pick
+# names you can live with before you run. Name agents after the FILTER model
+# (see below) — that's the thing that actually differs.
+#
 # `model` strings are OpenRouter model ids (https://openrouter.ai/models) when
 # OPENROUTER_API_KEY is set. With `provider: anthropic` they are Anthropic model
 # ids instead, so you can keep one agent on the direct Anthropic API.
+#
+# A leading `~` (e.g. `~anthropic/claude-haiku-latest`) is OpenRouter's alias
+# routing — it resolves to the current model behind that alias. It is safe in
+# YAML despite looking odd: a bare `~` means null only when it is the entire
+# value, not when it prefixes a string. Pinned ids like the ones below are more
+# reproducible; aliases keep you current. Pick per your taste.
+
+# --- EXPERIMENT DESIGN — read this before adding agents ----------------------
+#
+# Two models per agent, and they are NOT equally important:
+#
+#   model          the FILTER. Scores every ingested item — hundreds of calls a
+#                  run — and decides what appears in the report at all. This is
+#                  where nearly all the cost and all the interesting behaviour
+#                  lives.
+#   summary_model  writes the report intro. Two or three sentences, twice a
+#                  week. Rounding error, in both cost and influence.
+#
+# So vary ONE of them. Below, `summary_model` is identical for every agent and
+# only the filter differs. Vary both and a better-looking report is ambiguous:
+# did that agent select better items, or just write nicer prose about the same
+# ones? Holding the summary constant means every difference you see between two
+# reports comes from item selection.
+#
+# THE CONTROL PAIR: `haiku` and `haiku-control` run the same filter model on
+# purpose. Scoring is not perfectly repeatable — even at temperature 0, batching,
+# provider-side routing and each agent's own accumulated memory make two runs of
+# one model disagree on some borderline items. That pair measures how much: the
+# noise floor. A difference between two DIFFERENT models only means something
+# once it exceeds that floor, and the pair's agreement is the practical ceiling
+# for kappa, since no two models should agree more than a model agrees with
+# itself. It looks like a redundant agent and it is the opposite — without it
+# you cannot tell a real finding from sampling noise. Keep it.
+# ----------------------------------------------------------------------------
 
 agents:
   - name: haiku
     # Cheap/fast filter model — used for relevance, memory, vetting, race results.
     model: anthropic/claude-haiku-4.5
-    # Stronger model for writing the report intro. Defaults to `model` if omitted.
+    # Stronger model for writing the report intro. Defaults to `model` if
+    # omitted. Held constant across the fleet — see EXPERIMENT DESIGN above.
     summary_model: anthropic/claude-sonnet-4.6
     enabled: true
     # The primary agent decides which agent's "already fetched" state gates
@@ -34,16 +75,30 @@ agents:
     # agent is used if none is marked.
     primary: true
 
+  - name: haiku-control
+    # Intentional duplicate of `haiku`. Its disagreement with `haiku` is the
+    # noise floor, not a finding. Delete it and the comparison loses its
+    # yardstick.
+    model: anthropic/claude-haiku-4.5
+    summary_model: anthropic/claude-sonnet-4.6
+    enabled: true
+
+  # Prefer filters from DIFFERENT model families. Models from one family share
+  # training data and tend to agree with each other, so a fleet of near-siblings
+  # will look more unanimous than it deserves to.
   - name: gemini-flash
     model: google/gemini-2.5-flash
+    summary_model: anthropic/claude-sonnet-4.6
     enabled: true
 
   - name: gpt5-mini
     model: openai/gpt-5-mini
+    summary_model: anthropic/claude-sonnet-4.6
     enabled: true
 
   # Disabled agents are skipped entirely (no cost). Handy for parking a model
   # without deleting its history.
   - name: qwen
     model: qwen/qwen3-max
+    summary_model: anthropic/claude-sonnet-4.6
     enabled: false
