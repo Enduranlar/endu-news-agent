@@ -38,6 +38,13 @@ SCORE_BATCH_SIZE = 8
 # these are set with headroom rather than trimmed to the expected output size.
 MAX_TOKENS_CEILING = 16000
 
+# Some OpenRouter providers (Alibaba/Qwen among them) don't implement full
+# json_schema and silently downgrade the request to OpenAI's `json_object` mode.
+# That mode rejects any request whose messages don't contain the literal word
+# "json" ("'messages' must contain the word 'json' in some form"), so append it
+# to every structured call whose prompt doesn't already say it.
+_JSON_KEYWORD_HINT = "\n\nYanıtı yalnızca geçerli JSON olarak döndür."
+
 
 @dataclass
 class ScoreResult:
@@ -318,6 +325,8 @@ class LLMClient:
     def _complete_json(self, prompt: str, schema: dict, max_tokens: int,
                        call_type: str, model: Optional[str] = None) -> dict:
         model = model or self.filter_model
+        if "json" not in prompt.lower():
+            prompt += _JSON_KEYWORD_HINT
         if self.provider == "openrouter":
             text = self._openrouter_complete(
                 model, prompt, max_tokens, schema, call_type
