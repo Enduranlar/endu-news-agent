@@ -1,5 +1,8 @@
 # Secrets
 .env
+# Ad-hoc API probing scripts often hold a raw key — never commit them.
+*.sh
+!scripts/*.sh
 
 # Live operator config — your real curated sources + business context. The repo
 # ships *.example templates instead; copy them to these names (or keep the real
