@@ -44,6 +44,15 @@ CREATE TABLE IF NOT EXISTS ig_posts (
     likes        INTEGER DEFAULT 0,
     comments     INTEGER DEFAULT 0,
     relevant     INTEGER,                     -- NULL=unscored, 0/1 after scoring
+    -- WHY relevant has its value. Without this, a model judging an item
+    -- uninteresting, the memory layer suppressing a known repeat, and a failed
+    -- LLM batch all collapse into relevant=0 and cross-agent statistics end up
+    -- measuring dedup/errors instead of model judgment.
+    --   'model'         verdict came from the model
+    --   'memory_repeat' model said relevant, memory suppressed it as a repeat
+    --   'error'         the scoring call failed; relevant=0 is a fallback, not a judgment
+    --   NULL            unscored, or scored before this column existed
+    score_reason TEXT,
     category     TEXT,
     importance   INTEGER,
     one_line     TEXT,
@@ -61,6 +70,7 @@ CREATE TABLE IF NOT EXISTS web_items (
     text_excerpt TEXT DEFAULT '',
     published_at TEXT,
     relevant     INTEGER,
+    score_reason TEXT,                        -- see ig_posts.score_reason
     category     TEXT,
     importance   INTEGER,
     one_line     TEXT,
@@ -222,7 +232,23 @@ class Store:
         self.conn.execute("PRAGMA journal_mode=WAL;")
         self.conn.execute("PRAGMA foreign_keys=ON;")
         self.conn.executescript(SCHEMA)
+        self._migrate()
         self.conn.commit()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after a database was first created.
+
+        CREATE TABLE IF NOT EXISTS won't alter an existing table, so new columns
+        need an explicit ALTER. Existing rows keep NULL — deliberately, so old
+        scores read as "reason unknown" rather than being back-filled with a
+        guess."""
+        for table in ("ig_posts", "web_items"):
+            cols = {
+                r["name"]
+                for r in self.conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            if "score_reason" not in cols:
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN score_reason TEXT")
 
     def close(self) -> None:
         self.conn.close()
@@ -363,13 +389,15 @@ class Store:
         category: Optional[str],
         importance: Optional[int],
         one_line: Optional[str],
+        score_reason: Optional[str] = None,
     ) -> None:
         with self.tx() as conn:
             conn.execute(
-                "UPDATE ig_posts SET relevant=?, category=?, importance=?, "
-                "one_line=?, scored_at=? WHERE post_id=?",
+                "UPDATE ig_posts SET relevant=?, score_reason=?, category=?, "
+                "importance=?, one_line=?, scored_at=? WHERE post_id=?",
                 (
                     1 if relevant else 0,
+                    score_reason,
                     category,
                     importance,
                     one_line,
@@ -419,13 +447,15 @@ class Store:
         category: Optional[str],
         importance: Optional[int],
         one_line: Optional[str],
+        score_reason: Optional[str] = None,
     ) -> None:
         with self.tx() as conn:
             conn.execute(
-                "UPDATE web_items SET relevant=?, category=?, importance=?, "
-                "one_line=?, scored_at=? WHERE item_id=?",
+                "UPDATE web_items SET relevant=?, score_reason=?, category=?, "
+                "importance=?, one_line=?, scored_at=? WHERE item_id=?",
                 (
                     1 if relevant else 0,
+                    score_reason,
                     category,
                     importance,
                     one_line,
