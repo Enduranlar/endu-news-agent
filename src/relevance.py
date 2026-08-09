@@ -102,19 +102,24 @@ def _apply_memory(
     score: ScoreResult,
     url: str,
     res: RelevanceResult,
-) -> bool:
-    """Handle one scored item's memory outcome. Returns the effective `relevant`.
+) -> tuple[bool, str]:
+    """Handle one scored item's memory outcome.
 
-    A repeat of an already-reported fact is forced to relevant=False so it never
-    reaches a report; any new fact named by the model is written to memory."""
+    Returns (relevant, score_reason). The reason keeps the three ways an item can
+    end up relevant=0 distinguishable — model judgment, memory suppression, or a
+    failed call — so cross-agent analysis measures judgment rather than dedup or
+    errors."""
     relevant = score.relevant
+    reason = "error" if score.failed else "model"
     if not (memory and memory.enabled):
-        return relevant
+        return relevant, reason
 
     topic = memory.topic(score.memory_topic) if score.memory_topic else None
 
     if score.repeat and (topic is None or topic.suppress_repeats):
         relevant = False
+        if reason != "error":
+            reason = "memory_repeat"
         res.repeats += 1
 
     if topic and score.memory_subject and score.one_line:
@@ -129,7 +134,7 @@ def _apply_memory(
                 res.remembered += 1
         except Exception as exc:  # noqa: BLE001 — memory must never break scoring
             log.warning("remember failed (%s)", exc)
-    return relevant
+    return relevant, reason
 
 
 # --- Scoring -----------------------------------------------------------------
@@ -157,13 +162,14 @@ def _score_ig(
         recalled = _recall_for_batch(store, memory, items)
         scores = llm.score_items(items, interests, memory, recalled)
         for row, score in zip(batch, scores):
-            relevant = _apply_memory(store, memory, score, row["url"], res)
+            relevant, reason = _apply_memory(store, memory, score, row["url"], res)
             store.update_ig_score(
                 row["post_id"],
                 relevant,
                 score.category,
                 score.importance,
                 score.one_line,
+                score_reason=reason,
             )
             res.scored += 1
             if relevant:
@@ -193,13 +199,14 @@ def _score_web(
         recalled = _recall_for_batch(store, memory, items)
         scores = llm.score_items(items, interests, memory, recalled)
         for row, score in zip(batch, scores):
-            relevant = _apply_memory(store, memory, score, row["url"], res)
+            relevant, reason = _apply_memory(store, memory, score, row["url"], res)
             store.update_web_score(
                 row["item_id"],
                 relevant,
                 score.category,
                 score.importance,
                 score.one_line,
+                score_reason=reason,
             )
             res.scored += 1
             if relevant:

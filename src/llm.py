@@ -56,6 +56,9 @@ class ScoreResult:
     repeat: bool = False           # already reported — suppress
     memory_topic: str = ""         # topic id to remember this under ("" = nothing)
     memory_subject: str = ""       # subject the fact is about
+    # True when the scoring call failed and relevant=False is a safe fallback
+    # rather than the model's opinion. Recorded as score_reason='error'.
+    failed: bool = False
 
 
 @dataclass
@@ -428,7 +431,7 @@ class LLMClient:
         except Exception as exc:  # noqa: BLE001 — degrade gracefully, never crash a run
             log.warning("score_items batch failed (%s); marking batch not-relevant", exc)
             return [
-                ScoreResult(False, None, 1, "") for _ in items
+                ScoreResult(False, None, 1, "", failed=True) for _ in items
             ]
 
     @staticmethod
