@@ -36,7 +36,20 @@ SCORE_BATCH_SIZE = 8
 # max_tokens is a ceiling, not a spend: you're billed for tokens actually
 # generated. Reasoning models burn hundreds of tokens before emitting content, so
 # these are set with headroom rather than trimmed to the expected output size.
-MAX_TOKENS_CEILING = 16000
+MAX_TOKENS_CEILING = 32000
+
+# Reasoning models spend output tokens "thinking" before they answer, and that
+# thinking is billed and counts against max_tokens. For classification it buys
+# almost nothing and costs enormously: measured on one 8-item batch, gpt-5-nano
+# emitted 1738 output tokens (1472 of them reasoning) unprompted, versus 250
+# (zero reasoning) at minimal effort — same answer, 6.5x cheaper. Left alone,
+# these models burn the whole budget before emitting content, which triggers the
+# retry below and doubles every call.
+#
+# Not every model honours it (kimi-k2.6 still reasoned 2109 tokens at minimal),
+# which is why the token ceiling above is generous as well. No model in the
+# fleet REJECTS it — that was checked against all nine before shipping.
+JSON_REASONING_EFFORT = "minimal"
 
 # Structured calls (scoring, vetting, dedupe, race results) are classification,
 # not writing: we want the same item to get the same verdict tomorrow that it got
@@ -52,6 +65,10 @@ JSON_TEMPERATURE = 0.0
 # "json" ("'messages' must contain the word 'json' in some form"), so append it
 # to every structured call whose prompt doesn't already say it.
 _JSON_KEYWORD_HINT = "\n\nYanıtı yalnızca geçerli JSON olarak döndür."
+
+# At least one of these must appear in a result row for it to count as a verdict
+# rather than noise that happens to be shaped like JSON. See _align_results.
+_SCORE_FIELDS = frozenset({"relevant", "category", "importance", "one_line"})
 
 
 @dataclass
@@ -276,6 +293,10 @@ class LLMClient:
                 "type": "json_schema",
                 "json_schema": {"name": "result", "strict": True, "schema": schema},
             }
+            # Structured call => classification, not analysis. Keep thinking to a
+            # minimum so the budget goes to the answer. (Disabling reasoning
+            # outright isn't an option: some endpoints reject it as mandatory.)
+            body["reasoning"] = {"effort": JSON_REASONING_EFFORT}
         last: Optional[Exception] = None
         for attempt in range(4):
             try:
@@ -324,15 +345,30 @@ class LLMClient:
             model, prompt, max_tokens, schema, temperature
         )
         self._record(call_type, model, usage)
-        if text.strip() or finish != "length":
+        if finish != "length":
+            return text
+        # Out of budget. Two shapes, both unusable for a structured call:
+        # nothing came back at all (spent entirely on reasoning), or the JSON is
+        # cut mid-token and will never parse. Partial PROSE is still worth
+        # keeping, so only schema calls treat truncation-with-content as failure
+        # — returning it silently costs a whole batch at the json.loads below.
+        if text.strip() and schema is None:
             return text
         bigger = min(max_tokens * 4, MAX_TOKENS_CEILING)
         if bigger <= max_tokens:
+            log.warning(
+                "%s: %s hit the %d-token ceiling and its answer is unusable "
+                "(%s); giving up on this call",
+                call_type, model, max_tokens,
+                "empty" if not text.strip() else "truncated mid-JSON",
+            )
             return text
         log.warning(
-            "%s: %s used its whole %d-token budget on reasoning; retrying with %d "
+            "%s: %s exhausted its %d-token budget (%s); retrying with %d "
             "(raise max tokens for this model to avoid the double call)",
-            call_type, model, max_tokens, bigger,
+            call_type, model, max_tokens,
+            "no content" if not text.strip() else "truncated JSON",
+            bigger,
         )
         text, usage, _ = self._openrouter_call(
             model, prompt, bigger, schema, temperature
@@ -443,7 +479,7 @@ class LLMClient:
         )
 
         try:
-            data = self._complete_json(prompt, schema, 6000, "score")
+            data = self._complete_json(prompt, schema, 10000, "score")
             return self._align_results(data, len(items), interests)
         except Exception as exc:  # noqa: BLE001 — degrade gracefully, never crash a run
             log.warning("score_items batch failed (%s); marking batch not-relevant", exc)
@@ -491,15 +527,60 @@ class LLMClient:
             "aynı konu için hep AYNI ismi kullan, yoksa boş string).\n\n"
         )
 
+    @staticmethod
+    def _result_rows(data: Any) -> list:
+        """Pull the per-item rows out of whatever shape came back.
+
+        Providers that don't implement json_schema silently downgrade to
+        json_object, which enforces valid JSON but NOT the schema — so the
+        top-level shape is whatever the model felt like returning. Seen in
+        production: a bare array instead of {"results": [...]}, which raised
+        AttributeError on .get() and cost 131 batches (8 items each) in a single
+        run before this existed. Accepting the common shapes is far cheaper than
+        writing off the batch."""
+        if isinstance(data, list):
+            return data
+        if not isinstance(data, dict):
+            return []
+        rows = data.get("results")
+        if isinstance(rows, list):
+            return rows
+        # Array-like dict, either at the top level or under "results":
+        # {"0": {...}, "1": {...}} instead of a JSON array.
+        for candidate in (rows, data):
+            if isinstance(candidate, dict) and candidate and all(
+                str(k).isdigit() for k in candidate
+            ):
+                return [candidate[k] for k in sorted(candidate, key=lambda x: int(x))]
+        # Right shape, wrong key name ("items", "scores", …).
+        for value in data.values():
+            if isinstance(value, list):
+                return value
+        return []
+
     def _align_results(
-        self, data: dict, n: int, interests: Interests
+        self, data: Any, n: int, interests: Interests
     ) -> list[ScoreResult]:
         by_index: dict[int, ScoreResult] = {}
-        for r in data.get("results", []):
+        for pos, r in enumerate(self._result_rows(data)):
+            if not isinstance(r, dict):
+                continue
+            if not _SCORE_FIELDS & r.keys():
+                # Recognisable as a row, but not one field we understand. A
+                # provider that ignores the schema can also rename the fields:
+                # qwen3.7-flash returns [{"index":0,"ilgili":false,"sebep":…}] —
+                # Turkish for relevant/reason. Reading .get("relevant") there
+                # yields False for every item, which would be recorded as the
+                # model's considered verdict. Skip, and let the check below turn
+                # the batch into an honest error instead of eight fake verdicts.
+                continue
             try:
                 idx = int(r["index"])
             except (KeyError, ValueError, TypeError):
-                continue
+                # An unenforced schema often drops `index` too. The rows still
+                # arrive in prompt order, so fall back to position rather than
+                # discarding a result we actually got.
+                idx = pos
             cat = r.get("category")
             if cat not in interests.category_ids:
                 cat = None
@@ -518,6 +599,15 @@ class LLMClient:
                 memory_subject=self._truncate(
                     str(r.get("memory_subject", "") or "").strip(), 120
                 ),
+            )
+        if n and not by_index:
+            # Nothing usable came back. Raising sends this through the caller's
+            # failure path, so the batch is stored with score_reason='error'
+            # rather than n silent not-relevant verdicts that look like the
+            # model's opinion. Cross-agent analysis depends on that distinction.
+            raise ValueError(
+                "no usable results in response (provider ignored the schema); "
+                f"top-level {type(data).__name__}"
             )
         # Fill any missing index with a safe default.
         return [by_index.get(i, ScoreResult(False, None, 1, "")) for i in range(n)]
@@ -545,7 +635,7 @@ class LLMClient:
             "göründüğüne dair kısa bir not, TÜRKÇE)."
         )
         try:
-            data = self._complete_json(prompt, _VET_SCHEMA, 2000, "vet")
+            data = self._complete_json(prompt, _VET_SCHEMA, 6000, "vet")
             return VetResult(
                 on_topic=bool(data.get("on_topic", False)),
                 reason=self._truncate(str(data.get("reason", "")), 200),
@@ -682,7 +772,7 @@ class LLMClient:
             f"YARIŞ: {race_name}\n\nSAYFA METNİ:\n{self._truncate(page_text, 6000)}"
         )
         try:
-            data = self._complete_json(prompt, _RESULTS_SCHEMA, 2000, "race_results")
+            data = self._complete_json(prompt, _RESULTS_SCHEMA, 6000, "race_results")
             return RaceResultsExtract(
                 found=bool(data.get("found", False)),
                 summary=self._truncate(str(data.get("summary", "")), 140),
