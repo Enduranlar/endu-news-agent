@@ -127,7 +127,19 @@ def _score_schema(
         "index": {"type": "integer"},
         "relevant": {"type": "boolean"},
         "category": {"type": "string", "enum": category_ids},
-        "importance": {"type": "integer", "enum": [1, 2, 3, 4, 5]},
+        # Unconstrained on purpose — the 1-5 range is enforced in code, not in
+        # the schema, because no schema expression of it survives every
+        # provider:
+        #   enum [1..5]        Google rejects (enum is string-only there), and
+        #                      reports it as "requires unspecified property
+        #                      'index'" — pointing at the wrong field entirely.
+        #                      Cost gemini all 1,089 of its items on 2026-08-10.
+        #   minimum/maximum    Anthropic rejects: "For 'integer' type,
+        #                      properties maximum, minimum are not supported".
+        # A bare integer is accepted by both, and _align_results already clamps
+        # with max(1, min(5, ...)), so nothing downstream can see an out-of-range
+        # value. The prompt still asks for 1-5.
+        "importance": {"type": "integer"},
         "one_line": {"type": "string"},
     }
     required = ["index", "relevant", "category", "importance", "one_line"]
