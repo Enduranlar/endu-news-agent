@@ -66,6 +66,10 @@ JSON_TEMPERATURE = 0.0
 # to every structured call whose prompt doesn't already say it.
 _JSON_KEYWORD_HINT = "\n\nYanıtı yalnızca geçerli JSON olarak döndür."
 
+# At least one of these must appear in a result row for it to count as a verdict
+# rather than noise that happens to be shaped like JSON. See _align_results.
+_SCORE_FIELDS = frozenset({"relevant", "category", "importance", "one_line"})
+
 
 @dataclass
 class ScoreResult:
@@ -523,15 +527,60 @@ class LLMClient:
             "aynı konu için hep AYNI ismi kullan, yoksa boş string).\n\n"
         )
 
+    @staticmethod
+    def _result_rows(data: Any) -> list:
+        """Pull the per-item rows out of whatever shape came back.
+
+        Providers that don't implement json_schema silently downgrade to
+        json_object, which enforces valid JSON but NOT the schema — so the
+        top-level shape is whatever the model felt like returning. Seen in
+        production: a bare array instead of {"results": [...]}, which raised
+        AttributeError on .get() and cost 131 batches (8 items each) in a single
+        run before this existed. Accepting the common shapes is far cheaper than
+        writing off the batch."""
+        if isinstance(data, list):
+            return data
+        if not isinstance(data, dict):
+            return []
+        rows = data.get("results")
+        if isinstance(rows, list):
+            return rows
+        # Array-like dict, either at the top level or under "results":
+        # {"0": {...}, "1": {...}} instead of a JSON array.
+        for candidate in (rows, data):
+            if isinstance(candidate, dict) and candidate and all(
+                str(k).isdigit() for k in candidate
+            ):
+                return [candidate[k] for k in sorted(candidate, key=lambda x: int(x))]
+        # Right shape, wrong key name ("items", "scores", …).
+        for value in data.values():
+            if isinstance(value, list):
+                return value
+        return []
+
     def _align_results(
-        self, data: dict, n: int, interests: Interests
+        self, data: Any, n: int, interests: Interests
     ) -> list[ScoreResult]:
         by_index: dict[int, ScoreResult] = {}
-        for r in data.get("results", []):
+        for pos, r in enumerate(self._result_rows(data)):
+            if not isinstance(r, dict):
+                continue
+            if not _SCORE_FIELDS & r.keys():
+                # Recognisable as a row, but not one field we understand. A
+                # provider that ignores the schema can also rename the fields:
+                # qwen3.7-flash returns [{"index":0,"ilgili":false,"sebep":…}] —
+                # Turkish for relevant/reason. Reading .get("relevant") there
+                # yields False for every item, which would be recorded as the
+                # model's considered verdict. Skip, and let the check below turn
+                # the batch into an honest error instead of eight fake verdicts.
+                continue
             try:
                 idx = int(r["index"])
             except (KeyError, ValueError, TypeError):
-                continue
+                # An unenforced schema often drops `index` too. The rows still
+                # arrive in prompt order, so fall back to position rather than
+                # discarding a result we actually got.
+                idx = pos
             cat = r.get("category")
             if cat not in interests.category_ids:
                 cat = None
@@ -550,6 +599,15 @@ class LLMClient:
                 memory_subject=self._truncate(
                     str(r.get("memory_subject", "") or "").strip(), 120
                 ),
+            )
+        if n and not by_index:
+            # Nothing usable came back. Raising sends this through the caller's
+            # failure path, so the batch is stored with score_reason='error'
+            # rather than n silent not-relevant verdicts that look like the
+            # model's opinion. Cross-agent analysis depends on that distinction.
+            raise ValueError(
+                "no usable results in response (provider ignored the schema); "
+                f"top-level {type(data).__name__}"
             )
         # Fill any missing index with a safe default.
         return [by_index.get(i, ScoreResult(False, None, 1, "")) for i in range(n)]
