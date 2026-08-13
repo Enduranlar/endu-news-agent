@@ -29,9 +29,12 @@ Usage:
   python scripts/compare_agents.py --csv /tmp/wide.csv --json
   python scripts/compare_agents.py --limit 100        # more solo catches
 
-Reads the agent list from config/agents.yaml and honours AGENT_STATE_DIR. Parked
-agents (enabled: false) are included when they still have data. Dates are
-Europe/Istanbul.
+Reads the agent list from config/agents.yaml and honours AGENT_STATE_DIR. Agents
+that still have a database but are no longer in agents.yaml are skipped by
+default -- a retired agent's history stops the day it was retired, so it never
+judged anything ingested since, and those items drop out of the common set for
+everyone else. --include-parked brings them back; naming one with --agent
+always works. Dates are Europe/Istanbul.
 """
 
 from __future__ import annotations
@@ -60,29 +63,47 @@ JUDGED = "model"
 # --- loading -----------------------------------------------------------------
 
 
-def discover_agents(only: list[str]) -> list[tuple[str, Path]]:
-    """(name, db) for configured agents, plus any parked DB that still has data."""
-    pairs: list[tuple[str, Path]] = []
+def discover_agents(
+    only: list[str], include_parked: bool
+) -> tuple[list[tuple[str, Path]], list[str]]:
+    """((name, db) for each agent to compare, names of parked agents skipped).
+
+    "Parked" = a database on disk whose agent is no longer in agents.yaml.
+    Those are excluded by default, because a retired agent's history stops at
+    the day it was retired and every item ingested since is one the current
+    fleet judged and it didn't — which drops out of the common set and shrinks
+    the comparison for everyone else. nemotron-free ran once before being
+    removed and was costing 42% of the comparable items.
+
+    Naming a parked agent with --agent still includes it: an explicit request
+    beats the default.
+    """
+    configured: list[tuple[str, Path]] = []
     try:
         from src.config_loader import load_agents
 
-        pairs = [(a.name, Path(a.db_path)) for a in load_agents()]
+        configured = [(a.name, Path(a.db_path)) for a in load_agents()]
     except Exception:  # noqa: BLE001 — no agents.yaml => legacy single-agent layout
-        pairs = []
-    known = {p.name for _, p in pairs}
+        configured = []
+    known = {p.name for _, p in configured}
+    want = {n.lower() for n in only}
+    pairs, skipped = list(configured), []
     agents_dir = settings.DATA_DIR / "agents"
     if agents_dir.is_dir():
         for db in sorted(agents_dir.glob("*.db")):
-            if db.name not in known:
-                pairs.append((db.stem, db))       # parked but has data
+            if db.name in known:
+                continue
+            if include_parked or db.stem.lower() in want:
+                pairs.append((db.stem, db))
+            else:
+                skipped.append(db.stem)
     if not pairs and settings.DB_FILE.exists():
         pairs = [("(single-agent)", settings.DB_FILE)]
     if only:
-        want = {n.lower() for n in only}
         for miss in sorted(want - {n.lower() for n, _ in pairs}):
             print(f"warning: no agent named {miss!r}", file=sys.stderr)
         pairs = [(n, p) for n, p in pairs if n.lower() in want]
-    return [(n, p) for n, p in pairs if p.exists()]
+    return [(n, p) for n, p in pairs if p.exists()], skipped
 
 
 def since_to_utc(since: str | None) -> str | None:
@@ -413,6 +434,10 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--csv", metavar="PATH", help="dump the wide item x agent table")
     ap.add_argument("--json", action="store_true",
                     help="print a machine-readable summary instead of the report")
+    ap.add_argument("--include-parked", action="store_true",
+                    help="also compare agents that have a database but are no "
+                         "longer in agents.yaml (excluded by default: a retired "
+                         "agent's history ends early and shrinks the common set)")
     args = ap.parse_args(argv)
 
     try:
@@ -421,7 +446,7 @@ def main(argv: list[str]) -> int:
         print(f"bad --since {args.since!r}; expected YYYY-MM-DD", file=sys.stderr)
         return 2
 
-    agents = discover_agents(args.agent)
+    agents, parked = discover_agents(args.agent, args.include_parked)
     if not agents:
         print("No agent databases found. Has the fleet run yet?", file=sys.stderr)
         return 1
@@ -436,7 +461,11 @@ def main(argv: list[str]) -> int:
         print(f"agents    : {len(names)}"
               + (f"  ({len(empty)} with no judged items: "
                  f"{', '.join(empty)})" if empty else ""))
-        print(f"window    : {args.since or 'all time'}\n")
+        print(f"window    : {args.since or 'all time'}")
+        if parked:
+            print(f"skipped   : {', '.join(parked)} — has data but is no longer "
+                  "in agents.yaml (--include-parked to compare anyway)")
+        print()
 
     if len(live) < 2:
         sys.stdout.flush()   # keep the message below the context it refers to
