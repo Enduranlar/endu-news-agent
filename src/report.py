@@ -48,7 +48,6 @@ class ReportBundle:
     groups: list[tuple[str, list[ReportItem]]]  # (category label, items)
     upcoming_races: list[dict]
     item_count: int
-    agent: str = ""
     cost: dict | None = None   # {calls, tokens, cost} since the last report
     categories_covered: list[str] = field(default_factory=list)
     markdown: str = ""
@@ -63,9 +62,8 @@ class ReportBundle:
             return ""
         tokens = int(c.get("tokens") or 0)
         usd = float(c.get("cost") or 0.0)
-        who = f" ({self.agent})" if self.agent else ""
         cost_txt = f" · ${usd:.4f}" if usd else ""
-        return f"Bu rapor: {calls} çağrı · {tokens:,} token{cost_txt}{who}".replace(",", ".")
+        return f"Bu rapor: {calls} çağrı · {tokens:,} token{cost_txt}".replace(",", ".")
 
 
 def _ts_to_date(ts) -> str:
@@ -82,7 +80,6 @@ def build_report(
     llm: LLMClient,
     interests: Interests,
     period: str,
-    agent: str = "",
 ) -> ReportBundle:
     since = store.last_report_sent_at()
     ig_rows, web_rows = store.relevant_items_since(since)
@@ -146,9 +143,6 @@ def build_report(
         f"Dayanıklılık Sporları Haber Özeti — {period_label} brifingi "
         f"({istanbul_short_date_tr(now)})"
     )
-    if agent:
-        # Tag the subject so several agents' reports are distinct in the inbox.
-        title = f"[{agent}] {title}"
 
     intro = _write_intro(llm, period, groups)
 
@@ -161,7 +155,6 @@ def build_report(
         upcoming_races=upcoming_races,
         item_count=len(items),
         categories_covered=covered,
-        agent=agent,
         # What this report cost to produce: model spend since the previous report.
         cost=store.cost_since_ts(since),
     )

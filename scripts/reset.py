@@ -39,7 +39,7 @@ def collect_db() -> list[Path]:
     if not settings.DATA_DIR.exists():
         return []
     out = []
-    # data/*.db (legacy + shared) and data/agents/*.db (fleet)
+    # data/agent.db plus data/shared.db
     for p in sorted(settings.DATA_DIR.rglob("*")):
         if p.is_file() and (
             p.suffix == ".db"

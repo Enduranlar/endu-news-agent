@@ -9,6 +9,7 @@ Commands:
   approve --ig/--site  Approve a suggestion → append to the config file.
   dismiss --id       Dismiss a suggestion (never resurfaced).
   status             Print last-run times, today's credit spend, DB counts.
+  test-llm           One tiny live call per model — run it after a model change.
   test-sociavault    Milestone-1 live profile call for one handle (field-path check).
 
 Timing lives in cron, not here (see README / §10). --dry-run skips email and
@@ -28,7 +29,6 @@ from .config_loader import (
     append_ig_account,
     append_web_source,
     load_ig_accounts,
-    load_agents,
     load_interests,
     load_memory_config,
     load_web_sources,
@@ -43,46 +43,26 @@ log = logging.getLogger("agent.main")
 # --- daily -------------------------------------------------------------------
 
 
-def _fleet():
-    """Agent list without needing full settings (used by operator commands)."""
-    return load_agents(env_default=("", ""))
-
-
-def _pick_agent(name):
-    """Resolve --agent NAME, defaulting to the primary agent."""
-    agents = _fleet()
-    if name:
-        for a in agents:
-            if a.name == name:
-                return a
-        raise settings.ConfigError(
-            f"unknown agent {name!r}; enabled: {', '.join(a.name for a in agents)}"
-        )
-    return next((a for a in agents if a.primary), agents[0])
-
-
-def _make_llm(cfg, agent, store):
-    """Build the model client for one agent (OpenRouter unless pinned/absent)."""
+def _llm_client(cfg, store):
+    """The model client: filter model for scoring, summary model for prose."""
     from .llm import LLMClient
 
-    provider = agent.provider or cfg.default_provider
+    provider = cfg.default_provider
     key = cfg.api_key_for(provider)
     if not key:
         env = "OPENROUTER_API_KEY" if provider == "openrouter" else "ANTHROPIC_API_KEY"
-        raise settings.ConfigError(f"agent {agent.name!r} needs {env} for {provider}")
+        raise settings.ConfigError(f"{env} is required for provider {provider!r}")
     return LLMClient(
         api_key=key,
-        filter_model=agent.filter_model or cfg.llm_filter_model,
-        summary_model=agent.report_model or cfg.llm_summary_model,
+        filter_model=cfg.llm_filter_model,
+        summary_model=cfg.llm_summary_model,
         provider=provider, base_url=cfg.openrouter_base_url,
-        store=store, agent=agent.name,
+        store=store,
     )
 
 
 def cmd_daily(args: argparse.Namespace) -> int:
-    """Shared collect (SociaVault + web, ONCE) then per-agent scoring in parallel."""
-    from concurrent.futures import ThreadPoolExecutor
-
+    """Collect, score, discover — one pass over today's new items."""
     from .discovery import (
         active_handles, active_hosts, collect_candidates, vet_candidates,
     )
@@ -107,73 +87,56 @@ def cmd_daily(args: argparse.Namespace) -> int:
     web_sources = load_web_sources()
     interests = load_interests()
     memory = load_memory_config()
-    agents = load_agents(env_default=(cfg.llm_filter_model, cfg.llm_summary_model))
-    if args.agent:
-        agents = [a for a in agents if a.name in set(args.agent)]
-        if not agents:
-            log.error("no enabled agent matches %s", ", ".join(args.agent))
-            return 1
-    primary = next((a for a in agents if a.primary), agents[0])
-    log.info(
-        "fleet: %s (primary: %s)",
-        ", ".join(f"{a.name}={a.model}" for a in agents), primary.name,
-    )
+    log.info("models: filter=%s summary=%s via %s",
+             cfg.llm_filter_model, cfg.llm_summary_model, cfg.default_provider)
 
     settings.ensure_dirs()
-    (settings.DATA_DIR / "agents").mkdir(parents=True, exist_ok=True)
 
-    # --- Phase 1: shared collect (network + SociaVault credits, ONCE) --------
+    # shared.db holds the SociaVault credit ledger and the article-body fetch
+    # cache, both of which outlive any single run.
     shared = Store(settings.SHARED_DB_FILE)
     tracker = CreditTracker(shared, cfg.sociavault_daily_credit_budget, day)
+    out: dict = {}
     ig_collected = None
-    web_collected: list = []
-    calendar_html = None
-    candidates = None
+    spent = 0
 
-    # Reconcile into the primary DB first so discovery can see what's tracked
-    # (config is shared, so any agent's view would do).
-    with Store(primary.db_path) as pstore:
-        pstore.reconcile_sources(ig_accounts, web_sources)
-        known_handles = active_handles(pstore)
-        known_hosts = active_hosts(pstore)
-        skip = pstore.is_dismissed_or_tracked
-
-        with WebFetcher(cfg.outbound_proxy_url or None) as fetcher:
-            web_collected = collect_web(
-                fetcher, web_sources, shared,
-                cfg.web_first_run_limit, cfg.site_max_new_per_run, since_ts=since_ts,
-            )
-            calendar_html = fetcher.get_text(CALENDAR_URL)
-            if dry:
-                log.info("dry-run: skipping SociaVault calls (credit-spending)")
-            else:
-                with SociaVaultClient(cfg.sociavault_api_key, tracker) as sv:
-                    ig_collected = collect_instagram(
-                        sv, [a.handle for a in ig_accounts]
-                    )
-                    candidates = collect_candidates(
-                        sv, fetcher, interests, ig_collected.related,
-                        known_handles, known_hosts, skip,
-                    )
-
-    # --- Phase 2: per-agent work, in parallel --------------------------------
-    def run_agent(agent) -> dict:
-        # Each thread opens its own Store (SQLite connections aren't shareable),
-        # its own fetcher and model client; agents write to separate DB files.
-        out = {"agent": agent.name}
-        with Store(agent.db_path) as store, WebFetcher(
+    try:
+        with Store(settings.DB_FILE) as store, WebFetcher(
             cfg.outbound_proxy_url or None
-        ) as agent_fetcher:
-            llm = _make_llm(cfg, agent, store)
+        ) as fetcher:
+            llm = _llm_client(cfg, store)
             try:
                 store.reconcile_sources(ig_accounts, web_sources)
+
+                web_collected = collect_web(
+                    fetcher, web_sources, shared,
+                    cfg.web_first_run_limit, cfg.site_max_new_per_run,
+                    since_ts=since_ts,
+                )
+                calendar_html = fetcher.get_text(CALENDAR_URL)
+
+                candidates = None
+                if dry:
+                    log.info("dry-run: skipping SociaVault calls (credit-spending)")
+                else:
+                    with SociaVaultClient(cfg.sociavault_api_key, tracker) as sv:
+                        ig_collected = collect_instagram(
+                            sv, [a.handle for a in ig_accounts]
+                        )
+                        candidates = collect_candidates(
+                            sv, fetcher, interests, ig_collected.related,
+                            active_handles(store), active_hosts(store),
+                            store.is_dismissed_or_tracked,
+                        )
+
                 ig_res = (
-                    store_instagram(store, ig_collected, cfg.ig_first_run_limit, since_ts)
+                    store_instagram(store, ig_collected, cfg.ig_first_run_limit,
+                                    since_ts)
                     if ig_collected else None
                 )
                 web_res = store_web(store, web_collected)
                 race_res = run_race_tracking(
-                    store, agent_fetcher, llm, interests, today, since_floor,
+                    store, fetcher, llm, interests, today, since_floor,
                     calendar_html=calendar_html,
                 )
                 rel = score_pending(store, llm, interests, memory)
@@ -185,7 +148,7 @@ def cmd_daily(args: argparse.Namespace) -> int:
                     datetime.now(timezone.utc)
                     - timedelta(days=cfg.raw_item_retention_days)
                 ).isoformat()
-                out.update(
+                out = dict(
                     new_ig=ig_res.new_posts if ig_res else 0,
                     skipped_old=ig_res.skipped_old if ig_res else 0,
                     new_web=web_res.new_items,
@@ -200,49 +163,37 @@ def cmd_daily(args: argparse.Namespace) -> int:
                 )
             finally:
                 llm.close()
-        return out
+        # Read the credit ledger before the connection goes away — the summary
+        # below is logged after shared.db is closed.
+        spent = tracker.spent()
+    finally:
+        shared.close()
 
-    results: list[dict] = []
-    if len(agents) == 1:
-        results.append(run_agent(agents[0]))
-    else:
-        with ThreadPoolExecutor(max_workers=min(8, len(agents))) as pool:
-            futures = {pool.submit(run_agent, a): a for a in agents}
-            for fut, a in futures.items():
-                try:
-                    results.append(fut.result())
-                except Exception:  # noqa: BLE001 — one agent must not sink the run
-                    log.error("agent %s failed:\n%s", a.name, traceback.format_exc())
-
-    # --- Phase 3: summary ----------------------------------------------------
-    for r in sorted(results, key=lambda x: x["agent"]):
-        c = r.get("cost") or {}
-        log.info(
-            "RUN SUMMARY (daily%s) [%s]: new_ig=%d new_web=%d skipped_old=%d "
-            "scored=%d relevant=%d repeats=%d remembered=%d new_suggestions=%d "
-            "races_new=%d race_results=%d purged=%d/%d llm=%d calls/$%.4f",
-            " dry-run" if dry else "", r["agent"],
-            r.get("new_ig", 0), r.get("new_web", 0), r.get("skipped_old", 0),
-            r.get("scored", 0), r.get("relevant", 0), r.get("repeats", 0),
-            r.get("remembered", 0), r.get("suggestions", 0),
-            r.get("races_new", 0), r.get("race_results", 0),
-            r.get("purged", 0), r.get("mem_purged", 0),
-            int(c.get("calls") or 0), float(c.get("cost") or 0.0),
-        )
+    c = out.get("cost") or {}
+    log.info(
+        "RUN SUMMARY (daily%s): new_ig=%d new_web=%d skipped_old=%d scored=%d "
+        "relevant=%d repeats=%d remembered=%d new_suggestions=%d races_new=%d "
+        "race_results=%d purged=%d/%d llm=%d calls/$%.4f",
+        " dry-run" if dry else "",
+        out.get("new_ig", 0), out.get("new_web", 0), out.get("skipped_old", 0),
+        out.get("scored", 0), out.get("relevant", 0), out.get("repeats", 0),
+        out.get("remembered", 0), out.get("suggestions", 0),
+        out.get("races_new", 0), out.get("race_results", 0),
+        out.get("purged", 0), out.get("mem_purged", 0),
+        int(c.get("calls") or 0), float(c.get("cost") or 0.0),
+    )
     log.info(
         "credits spent today: %d/%d%s",
-        tracker.spent(), cfg.sociavault_daily_credit_budget,
+        spent, cfg.sociavault_daily_credit_budget,
         " [BUDGET HIT]" if (ig_collected and ig_collected.budget_hit) else "",
     )
-    shared.close()
     return 0
-
 
 # --- report ------------------------------------------------------------------
 
 
 def cmd_report(args: argparse.Namespace) -> int:
-    """Build + archive + email one report PER agent."""
+    """Build, archive and email the twice-weekly report."""
     from .archive import archive_report
     from .emailer import EmailError, send_report
     from .report import build_report
@@ -252,59 +203,45 @@ def cmd_report(args: argparse.Namespace) -> int:
     cfg = settings.load_settings(require_email=not dry, require_llm=True)
     day = istanbul_day()
     interests = load_interests()
-    agents = load_agents(env_default=(cfg.llm_filter_model, cfg.llm_summary_model))
-    if args.agent:
-        agents = [a for a in agents if a.name in set(args.agent)]
-        if not agents:
-            log.error("no enabled agent matches %s", ", ".join(args.agent))
-            return 1
 
-    failures = 0
-    for agent in agents:
-        with Store(agent.db_path) as store:
-            if not dry and store.report_already_sent_today(period, day) and not args.force:
-                log.info("[%s] report %s already sent today (%s); skipping (use --force)",
-                         agent.name, period, day)
-                continue
+    with Store(settings.DB_FILE) as store:
+        if not dry and store.report_already_sent_today(period, day) and not args.force:
+            log.info("report %s already sent today (%s); skipping (use --force)",
+                     period, day)
+            return 0
 
-            llm = _make_llm(cfg, agent, store)
-            try:
-                bundle = build_report(
-                    store, llm, interests, period,
-                    agent="" if agent.legacy else agent.name,
-                )
-            finally:
-                llm.close()
+        llm = _llm_client(cfg, store)
+        try:
+            bundle = build_report(store, llm, interests, period)
+        finally:
+            llm.close()
 
-            archived = archive_report(bundle, agent.reports_dir)
-            report_id = store.create_report(period, archived.relpath, bundle.item_count)
-            log.info("[%s] report built: %d items, %d categories, archived %s",
-                     agent.name, bundle.item_count,
-                     len(bundle.categories_covered), archived.relpath)
+        archived = archive_report(bundle, settings.REPORTS_DIR)
+        report_id = store.create_report(period, archived.relpath, bundle.item_count)
+        log.info("report built: %d items, %d categories, archived %s",
+                 bundle.item_count, len(bundle.categories_covered), archived.relpath)
 
-            if dry:
-                print(bundle.markdown)
-                log.info("[%s] dry-run: not emailed, sent_at not recorded", agent.name)
-                continue
+        if dry:
+            print(bundle.markdown)
+            log.info("dry-run: not emailed, sent_at not recorded")
+            return 0
 
-            try:
-                send_report(cfg, bundle.title, bundle.html, bundle.markdown)
-            except EmailError as exc:
-                log.error("[%s] EMAIL FAILED: %s (report kept at %s)",
-                          agent.name, exc, archived.path)
-                failures += 1
-                continue
+        try:
+            send_report(cfg, bundle.title, bundle.html, bundle.markdown)
+        except EmailError as exc:
+            log.error("EMAIL FAILED: %s (report kept at %s)", exc, archived.path)
+            return 2   # non-zero so cron surfaces send failures
 
-            store.mark_report_sent(report_id)
-            log.info("[%s] report %s sent and recorded", agent.name, period)
-
-    return 2 if failures else 0   # non-zero so cron surfaces send failures
+        store.mark_report_sent(report_id)
+        log.info("report %s sent and recorded", period)
+    return 0
 
 
 # --- discover (standalone) ---------------------------------------------------
 
 
 def cmd_discover(args: argparse.Namespace) -> int:
+    """Run source discovery on its own (the daily run does this too)."""
     from .discovery import (
         active_handles, active_hosts, collect_candidates, vet_candidates,
     )
@@ -317,54 +254,28 @@ def cmd_discover(args: argparse.Namespace) -> int:
         return 0
 
     interests = load_interests()
-    agents = load_agents(env_default=(cfg.llm_filter_model, cfg.llm_summary_model))
-    primary = next((a for a in agents if a.primary), agents[0])
     shared = Store(settings.SHARED_DB_FILE)
     tracker = CreditTracker(shared, cfg.sociavault_daily_credit_budget)
-
-    with Store(primary.db_path) as pstore:
-        with WebFetcher(cfg.outbound_proxy_url or None) as fetcher, SociaVaultClient(
-            cfg.sociavault_api_key, tracker
-        ) as sv:
-            candidates = collect_candidates(
-                sv, fetcher, interests, [],
-                active_handles(pstore), active_hosts(pstore),
-                pstore.is_dismissed_or_tracked,
-            )
-
-    for agent in agents:
-        with Store(agent.db_path) as store:
-            llm = _make_llm(cfg, agent, store)
+    try:
+        with Store(settings.DB_FILE) as store:
+            llm = _llm_client(cfg, store)
             try:
+                with WebFetcher(
+                    cfg.outbound_proxy_url or None
+                ) as fetcher, SociaVaultClient(
+                    cfg.sociavault_api_key, tracker
+                ) as sv:
+                    candidates = collect_candidates(
+                        sv, fetcher, interests, [],
+                        active_handles(store), active_hosts(store),
+                        store.is_dismissed_or_tracked,
+                    )
                 disc = vet_candidates(store, llm, interests, candidates)
             finally:
                 llm.close()
-            log.info("[%s] discovery: %d new suggestions",
-                     agent.name, disc.new_suggestions)
-    shared.close()
-    return 0
-
-
-def cmd_discover(args: argparse.Namespace) -> int:
-    from .discovery import run_discovery
-    from .ingest_web import WebFetcher
-    from .llm import LLMClient
-    from .sociavault import CreditTracker, SociaVaultClient
-
-    cfg = settings.load_settings(require_email=False, require_llm=True)
-    if args.dry_run:
-        log.info("dry-run: discovery skipped (credit-spending)")
-        return 0
-
-    with Store() as store:
-        interests = load_interests()
-        tracker = CreditTracker(store, cfg.sociavault_daily_credit_budget)
-        llm = LLMClient(cfg.anthropic_api_key, cfg.llm_filter_model, cfg.llm_summary_model)
-        with WebFetcher(cfg.outbound_proxy_url or None) as fetcher, SociaVaultClient(
-            cfg.sociavault_api_key, tracker
-        ) as sv:
-            disc = run_discovery(store, sv, fetcher, llm, interests, related=[])
-        log.info("discovery: %d new suggestions", disc.new_suggestions)
+            log.info("discovery: %d new suggestions", disc.new_suggestions)
+    finally:
+        shared.close()
     return 0
 
 
@@ -372,7 +283,7 @@ def cmd_discover(args: argparse.Namespace) -> int:
 
 
 def cmd_suggestions(args: argparse.Namespace) -> int:
-    with Store(_pick_agent(getattr(args, "agent", None)).db_path) as store:
+    with Store(settings.DB_FILE) as store:
         rows = store.pending_suggestions()
         if not rows:
             print("No pending suggestions.")
@@ -393,9 +304,9 @@ def cmd_suggestions(args: argparse.Namespace) -> int:
 
 
 def cmd_approve(args: argparse.Namespace) -> int:
-    # Approving appends to the SHARED config file; the status is marked in this
-    # agent's DB (the web UI marks it across the whole fleet).
-    with Store(_pick_agent(getattr(args, "agent", None)).db_path) as store:
+    # Approving appends to the config file and marks the suggestion decided,
+    # so it never resurfaces.
+    with Store(settings.DB_FILE) as store:
         if args.ig:
             handle = args.ig
             added = append_ig_account(handle)
@@ -471,7 +382,7 @@ def cmd_web(args: argparse.Namespace) -> int:
 
 def cmd_memory(args: argparse.Namespace) -> int:
     """Inspect / prune what the agent remembers across reports."""
-    with Store(_pick_agent(getattr(args, "agent", None)).db_path) as store:
+    with Store(settings.DB_FILE) as store:
         if args.forget is not None:
             ok = store.forget_memory(args.forget)
             print(
@@ -513,7 +424,7 @@ def cmd_memory(args: argparse.Namespace) -> int:
 
 
 def cmd_dismiss(args: argparse.Namespace) -> int:
-    with Store(_pick_agent(getattr(args, "agent", None)).db_path) as store:
+    with Store(settings.DB_FILE) as store:
         ok = store.set_suggestion_status(args.id, "dismissed")
         if ok:
             print(f"Suggestion #{args.id} dismissed; it will never resurface.")
@@ -528,13 +439,13 @@ def cmd_dismiss(args: argparse.Namespace) -> int:
 def cmd_status(args: argparse.Namespace) -> int:
     day = istanbul_day()
     budget_env = settings_int_safe("SOCIAVAULT_DAILY_CREDIT_BUDGET", 400)
-    agents = _fleet()
 
-    # SociaVault credits are global (spent once per run, shared by the fleet).
+    # SociaVault credits live in shared.db: the ledger has to survive even when
+    # the main database is rebuilt.
     shared_path = (
         settings.SHARED_DB_FILE
         if settings.SHARED_DB_FILE.exists()
-        else agents[0].db_path
+        else settings.DB_FILE
     )
     spent = 0
     if shared_path.exists():
@@ -543,39 +454,31 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     print(f"=== Endurance News Agent status ({day}, Europe/Istanbul) ===")
     print(f"SociaVault credits today (shared): {spent} / {budget_env}")
-    print(f"Agents: {', '.join(a.name for a in agents)}")
 
-    grand = 0.0
-    for agent in agents:
-        label = f"{agent.name} ({agent.model or 'model from .env'})"
-        if not agent.db_path.exists():
-            print(f"\n--- {label} ---\n  (no database yet — hasn't run)")
-            continue
-        with Store(agent.db_path) as store:
-            counts = store.counts()
-            total = store.cost_totals()
-            today_cost = store.cost_totals(since_day=day)
-            grand += float(total.get("cost") or 0.0)
-            print(f"\n--- {label} ---")
-            print(f"  db: {agent.db_path}")
-            print(
-                f"  llm: {int(total['calls'])} calls, ${float(total['cost']):.4f} total"
-                f"  |  today: {int(today_cost['calls'])} calls, "
-                f"${float(today_cost['cost']):.4f}"
-            )
-            for k, v in counts.items():
-                print(f"  {k:24s}: {v}")
-            print(f"  last report sent        : {store.last_report_sent_at() or 'never'}")
+    if not settings.DB_FILE.exists():
+        print(f"\ndb: {settings.DB_FILE}\n  (no database yet — hasn't run)")
+        return 0
 
-    if len(agents) > 1:
-        print(f"\nTOTAL LLM spend (all agents, all time): ${grand:.4f}")
+    with Store(settings.DB_FILE) as store:
+        counts = store.counts()
+        total = store.cost_totals()
+        today_cost = store.cost_totals(since_day=day)
+        print(f"\ndb: {settings.DB_FILE}")
+        print(
+            f"  llm: {int(total['calls'])} calls, ${float(total['cost']):.4f} total"
+            f"  |  today: {int(today_cost['calls'])} calls, "
+            f"${float(today_cost['cost']):.4f}"
+        )
+        for k, v in counts.items():
+            print(f"  {k:24s}: {v}")
+        print(f"  last report sent        : {store.last_report_sent_at() or 'never'}")
 
-    if getattr(args, "sources", False) and agents[0].db_path.exists():
-        with Store(agents[0].db_path) as store:
+        if getattr(args, "sources", False):
             print("\nActive sources (last run):")
             for s_ in store.active_sources():
                 lbl = f"@{s_['key']}" if s_["kind"] == "ig" else s_["key"]
-                print(f"  [{s_['kind']:4s}] {lbl}  last_run={s_['last_run_at'] or 'never'}")
+                print(f"  [{s_['kind']:4s}] {lbl}  "
+                      f"last_run={s_['last_run_at'] or 'never'}")
     return 0
 
 
@@ -591,73 +494,57 @@ def settings_int_safe(name: str, default: int) -> int:
 # --- test-sociavault (Milestone 1) -------------------------------------------
 
 
-def cmd_test_agents(args: argparse.Namespace) -> int:
-    """Preflight: check every agent in agents.yaml can actually run.
+def cmd_test_llm(args: argparse.Namespace) -> int:
+    """Preflight: check the configured models can actually run.
 
     Makes one tiny real call per model (fractions of a cent) exercising exactly
     what the pipeline needs — a JSON-schema structured call on the filter model,
-    plus a text call on the summary model when it differs. Exits non-zero if any
-    agent fails, so it can gate a deploy or run from cron."""
-    import time as _time
+    plus a text call on the summary model when it differs. Exits non-zero on
+    failure, so it can gate a deploy or run from cron.
+
+    Worth running after any model or provider change: a model id valid on one
+    provider is often invalid on another, and the failure otherwise surfaces
+    mid-run as a 400 on every scoring batch."""
     from pathlib import Path
 
     cfg = settings.load_settings(require_email=False, require_llm=True)
-    agents = load_agents(env_default=(cfg.llm_filter_model, cfg.llm_summary_model))
-    if args.agent:
-        agents = [a for a in agents if a.name in set(args.agent)]
-        if not agents:
-            print("no enabled agent matches " + ", ".join(args.agent), file=sys.stderr)
-            return 1
+    provider = cfg.default_provider
 
-    # In-memory ledger so the check never writes to the real agent databases.
+    # In-memory ledger so the check never writes to the real database.
     mem = Store(Path(":memory:"))
+    print(f"Checking {provider}: {cfg.llm_filter_model}"
+          + (f" + {cfg.llm_summary_model}"
+             if cfg.llm_summary_model != cfg.llm_filter_model else "")
+          + " — one small live call per model.\n")
+    try:
+        llm = _llm_client(cfg, mem)
+    except settings.ConfigError as exc:
+        print(f"[FAIL] {exc}", file=sys.stderr)
+        mem.close()
+        return 1
+    try:
+        res = llm.probe()
+    finally:
+        llm.close()
+    cost = float(mem.cost_totals().get("cost") or 0.0)
+    mem.close()
 
-    print(f"Checking {len(agents)} agent(s) — one small live call per model.\n")
-    rows, failures = [], 0
-    for agent in agents:
-        provider = agent.provider or cfg.default_provider
-        before = float(mem.cost_totals().get("cost") or 0.0)
-        try:
-            llm = _make_llm(cfg, agent, mem)
-        except settings.ConfigError as exc:
-            rows.append((agent, provider, None, 0.0, str(exc)))
-            failures += 1
-            continue
-        try:
-            res = llm.probe()
-        finally:
-            llm.close()
-        cost = float(mem.cost_totals().get("cost") or 0.0) - before
-        rows.append((agent, provider, res, cost, res.error))
-        if not res.ok:
-            failures += 1
-
-    width = max((len(a.name) for a, *_ in rows), default=5)
-    for agent, provider, res, cost, err in rows:
-        mark = "OK  " if (res and res.ok) else "FAIL"
-        models = agent.model
-        if agent.summary_model and agent.summary_model != agent.model:
-            models += f"  +  {agent.summary_model}"
-        timing = f"{res.latency_s:5.1f}s" if res else "    -"
-        print(f"[{mark}] {agent.name:<{width}}  {timing}  ${cost:.5f}  "
-              f"{provider}: {models}")
-        if err:
-            print(f"        └─ {err}")
-        elif res and not res.text_ok:
-            print("        └─ summary model failed")
-
-    total = sum(c for *_, c, _ in rows)
-    print(f"\n{len(rows) - failures}/{len(rows)} agent(s) OK · check cost ${total:.5f}")
-    sys.stdout.flush()
-    if failures:
+    mark = "OK  " if res.ok else "FAIL"
+    print(f"[{mark}] {res.latency_s:5.1f}s  ${cost:.5f}")
+    if res.error:
+        print(f"       └─ {res.error}")
+    elif not res.text_ok:
+        print("       └─ summary model failed")
+    if not res.ok:
         print(
-            "\nCommon causes: a model id that doesn't exist on the provider, a model "
-            "that can't do structured outputs (JSON schema — required), no credit, "
-            "or a missing/invalid API key.",
+            "\nCommon causes: a model id that doesn't exist on this provider "
+            "(OpenRouter wants e.g. 'anthropic/claude-haiku-4.5', the Anthropic "
+            "API wants 'claude-haiku-4-5'), a model that can't do structured "
+            "outputs (JSON schema — required), no credit, or a bad API key.",
             file=sys.stderr,
         )
-    mem.close()
-    return 1 if failures else 0
+        return 1
+    return 0
 
 
 def cmd_test_races(args: argparse.Namespace) -> int:
@@ -729,8 +616,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_daily = sub.add_parser("daily", help="ingest + score + discover")
     p_daily.add_argument("--dry-run", action="store_true",
                          help="skip credit-spending SociaVault calls")
-    p_daily.add_argument("--agent", action="append", metavar="NAME",
-                         help="run only these agents (repeatable)")
     p_daily.set_defaults(func=cmd_daily)
 
     p_report = sub.add_parser("report", help="build + email the summary")
@@ -739,8 +624,6 @@ def build_parser() -> argparse.ArgumentParser:
                           help="build + archive but don't email")
     p_report.add_argument("--force", action="store_true",
                           help="send even if one was already sent today")
-    p_report.add_argument("--agent", action="append", metavar="NAME",
-                          help="report only for these agents (repeatable)")
     p_report.set_defaults(func=cmd_report)
 
     p_disc = sub.add_parser("discover", help="run source discovery standalone")
@@ -748,14 +631,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_disc.set_defaults(func=cmd_discover)
 
     p_sug = sub.add_parser("suggestions", help="list pending suggestions")
-    p_sug.add_argument("--agent", help="which agent's queue (default: primary)")
     p_sug.set_defaults(func=cmd_suggestions)
 
     p_app = sub.add_parser("approve", help="approve a suggestion")
     g = p_app.add_mutually_exclusive_group(required=True)
     g.add_argument("--ig", metavar="HANDLE", help="approve an IG handle")
     g.add_argument("--site", metavar="URL", help="approve a website/feed URL")
-    p_app.add_argument("--agent", help="which agent's queue (default: primary)")
     p_app.add_argument("--as", dest="as_type", choices=["rss", "site"], default="site",
                        help="for --site: feed type (default site)")
     p_app.set_defaults(func=cmd_approve)
@@ -775,7 +656,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_web.set_defaults(func=cmd_web)
 
     p_mem = sub.add_parser("memory", help="inspect what the agent remembers")
-    p_mem.add_argument("--agent", help="which agent's memory (default: primary)")
     p_mem.add_argument("--topic", help="filter by memory topic id")
     p_mem.add_argument("--query", help="substring match on subject/fact")
     p_mem.add_argument("--limit", type=int, default=50)
@@ -787,19 +667,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_dis = sub.add_parser("dismiss", help="dismiss a suggestion")
     p_dis.add_argument("--id", type=int, required=True)
-    p_dis.add_argument("--agent", help="which agent's queue (default: primary)")
     p_dis.set_defaults(func=cmd_dismiss)
 
     p_stat = sub.add_parser("status", help="print run/credit/cost/DB status")
     p_stat.add_argument("--sources", action="store_true", help="also list sources")
     p_stat.set_defaults(func=cmd_status)
 
-    p_agents = sub.add_parser(
-        "test-agents", help="check every agent in agents.yaml can actually run"
+    p_llm = sub.add_parser(
+        "test-llm", help="check the configured models can actually run"
     )
-    p_agents.add_argument("--agent", action="append", metavar="NAME",
-                          help="check only these agents (repeatable)")
-    p_agents.set_defaults(func=cmd_test_agents)
+    p_llm.set_defaults(func=cmd_test_llm)
 
     p_races = sub.add_parser(
         "test-races", help="fetch + parse the teamrunbo race calendar (no DB writes)"

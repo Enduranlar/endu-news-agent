@@ -2,8 +2,7 @@
 
 Two providers behind one interface — OpenRouter (recommended: many models via one
 key, and it returns the real per-call cost, which we log for the cost report) and
-the direct Anthropic API. Each agent in the fleet gets its own client, so several
-models can run the same pipeline side by side.
+the direct Anthropic API.
 
 Two models per the brief: a cheap/fast filter model (default claude-haiku-4-5)
 for per-item relevance + categorization and source vetting, and a stronger model
@@ -47,16 +46,16 @@ MAX_TOKENS_CEILING = 32000
 # retry below and doubles every call.
 #
 # Not every model honours it (kimi-k2.6 still reasoned 2109 tokens at minimal),
-# which is why the token ceiling above is generous as well. No model in the
-# fleet REJECTS it — that was checked against all nine before shipping.
+# which is why the token ceiling above is generous as well. No model REJECTED it
+# when this was checked across nine providers in 2026-08.
 JSON_REASONING_EFFORT = "minimal"
 
 # Structured calls (scoring, vetting, dedupe, race results) are classification,
 # not writing: we want the same item to get the same verdict tomorrow that it got
 # today. Providers default to ~1.0, which makes borderline items land on either
-# side of the line run to run — noise that shows up as cross-agent "disagreement"
-# and inflates every comparison statistic. Prose (the report intro) keeps the
-# provider default, where sampling variety is a feature.
+# side of the line run to run, which makes yesterday's verdicts irreproducible.
+# Prose (the report intro) keeps the provider default, where sampling variety is
+# a feature.
 JSON_TEMPERATURE = 0.0
 
 # Some OpenRouter providers (Alibaba/Qwen among them) don't implement full
@@ -95,7 +94,7 @@ class VetResult:
 
 @dataclass
 class ProbeResult:
-    """Outcome of a cheap end-to-end health check for one agent."""
+    """Outcome of a cheap end-to-end health check."""
 
     ok: bool = False
     structured_ok: bool = False
@@ -235,7 +234,7 @@ def _openrouter_error(resp: "httpx.Response") -> str:
 
 
 class LLMClient:
-    """Model client for one agent.
+    """The agent's model client.
 
     provider="openrouter" (recommended) uses OpenAI-compatible chat completions:
     many models under one key, and the response carries the real cost, which we
@@ -248,12 +247,11 @@ class LLMClient:
 
     def __init__(self, api_key: str, filter_model: str, summary_model: str,
                  provider: str = "anthropic", base_url: str = "",
-                 store: Any = None, agent: str = ""):
+                 store: Any = None):
         self.provider = provider or "anthropic"
         self.filter_model = filter_model
         self.summary_model = summary_model
         self.store = store
-        self.agent = agent
         self.client = None
         self._http = None
         if self.provider == "openrouter":
@@ -281,7 +279,7 @@ class LLMClient:
             return
         try:
             self.store.record_llm_usage(
-                agent=self.agent, model=model, call_type=call_type,
+                model=model, call_type=call_type,
                 prompt_tokens=int(usage.get("prompt_tokens") or 0),
                 completion_tokens=int(usage.get("completion_tokens") or 0),
                 cost_usd=float(usage.get("cost") or 0.0),
