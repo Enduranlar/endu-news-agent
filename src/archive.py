@@ -30,7 +30,7 @@ def archive_report(
     bundle: ReportBundle, reports_dir: Path | None = None
 ) -> ArchivedReport:
     """Archive a report. `reports_dir` defaults to the shared reports/ root; each
-    agent passes its own reports/<agent>/ so fleets keep separate histories."""
+    The caller passes the reports root; files land in <root>/<YYYY>/."""
     base = reports_dir or settings.REPORTS_DIR
     base.mkdir(parents=True, exist_ok=True)
     now = istanbul_now()

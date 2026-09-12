@@ -20,6 +20,8 @@ data/*.db-wal
 data/*.db-shm
 logs/*.log
 logs/*.log.*
+# Logs copied off the VPS for one-off analysis.
+/*.log
 
 # Reports archive (operator choice — keep tracked if you want history in git).
 # Commented out by default so reports/index.* and dated reports persist.

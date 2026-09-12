@@ -77,7 +77,6 @@ cp config/igaccounts.md.example  config/igaccounts.md
 cp config/websites.md.example    config/websites.md
 cp config/interests.yaml.example config/interests.yaml
 cp config/memory.yaml.example    config/memory.yaml       # optional (see Memory)
-cp config/agents.yaml.example    config/agents.yaml       # optional (see Running several models)
 $EDITOR config/igaccounts.md     # one IG handle per line
 $EDITOR config/websites.md       # rss|<url> or site|<url> per line
 $EDITOR config/interests.yaml    # categories + business context (tunes the LLM)
@@ -125,8 +124,8 @@ send.
 
 | Command | Purpose |
 |---|---|
-| `daily` | Ingest IG + web, score relevance, run discovery. Cron 06:30. `--agent NAME` to limit. |
-| `report --period monday\|friday` | Build + archive + email one summary **per agent**. `--force` to resend, `--agent NAME` to limit. |
+| `daily` | Ingest IG + web, score relevance, run discovery. Cron 06:30. |
+| `report --period monday\|friday` | Build + archive + email the summary. `--force` to resend. |
 | `discover` | Run source discovery on its own. |
 | `web` | Run the web admin UI (review suggestions, manual add) — bind to your Tailscale IP. |
 | `add-site <url> [note]` | Auto-detect a site's RSS/Atom feed and add it to `config/websites.md`. |
@@ -134,9 +133,9 @@ send.
 | `approve --ig <handle>` | Approve an IG suggestion → append to `config/igaccounts.md`. |
 | `approve --site <url> [--as rss\|site]` | Approve a website → append to `config/websites.md`. |
 | `dismiss --id <n>` | Dismiss a suggestion; it never resurfaces. |
-| `status` | Per-agent counts + **LLM cost**, shared credit spend. `--sources` lists sources. |
+| `status` | DB counts + **LLM cost**, credit spend. `--sources` lists sources. |
 | `memory [--topic X] [--query Q] [--forget ID] [--purge-expired]` | Inspect / prune what the agent remembers. |
-| `test-agents [--agent NAME]` | Check every agent in `agents.yaml` can actually run (tiny live call each). |
+| `test-llm` | Check the configured models can actually run (one tiny live call each). |
 | `test-races [--all] [--limit N]` | Fetch + parse the teamrunbo race calendar (no DB writes). |
 | `test-sociavault --handle <h>` | Live profile call (field-path check). |
 
@@ -257,73 +256,59 @@ deleted).
 
 ---
 
-## Running several models side by side (agent fleet)
+## Choosing the model
 
-Compare models on the *same* input: create `config/agents.yaml` (copy the
-`.example`) and each agent runs the whole pipeline with its own model.
+One model pair does the work: a cheap/fast **filter model** scores every ingested
+item, and a stronger **summary model** writes the twice-weekly report intro. Both
+come from `.env`:
 
-```yaml
-agents:
-  - name: haiku
-    model: anthropic/claude-haiku-4.5       # OpenRouter model id
-    summary_model: anthropic/claude-sonnet-4.6
-    primary: true
-  - name: gemini-flash
-    model: google/gemini-2.5-flash
-  - name: gpt5-mini
-    model: openai/gpt-5-mini
-    enabled: false                           # parked, costs nothing
+```ini
+LLM_FILTER_MODEL=anthropic/claude-haiku-4.5
+LLM_SUMMARY_MODEL=anthropic/claude-sonnet-4.6
 ```
 
-**Shared once per run** — so a fleet costs the same SociaVault credits and web
-traffic as a single agent: every SociaVault call, all RSS/site fetches, the race
-calendar, and the discovery candidate lookups. **Per agent**: database, memory,
-suggestions, reports and cost.
+**Model ids are provider-specific and are not interchangeable.** The same model
+is named differently on each provider, and the wrong form fails on every single
+call rather than degrading:
 
-```
-data/shared.db                  SociaVault credit log + fetch dedup (global)
-data/agents/<name>.db           that agent's items, scores, memory, cost
-reports/<name>/<YYYY>/...md     that agent's archive (+ its own index)
-```
+| | filter | summary |
+|---|---|---|
+| OpenRouter (`OPENROUTER_API_KEY`) | `anthropic/claude-haiku-4.5` | `anthropic/claude-sonnet-4.6` |
+| Anthropic API (`ANTHROPIC_API_KEY`) | `claude-haiku-4-5` | `claude-sonnet-4-6` |
 
-Agents run **in parallel** (thread pool; separate SQLite files, so no
-contention). You get **one email per agent**, subject-tagged `[haiku] …`, each
-ending with what that report cost. Suggestions from every agent land in the same
-`igaccounts.md` / `websites.md` when approved — the web UI merges them and shows
-which agents proposed each.
+OpenRouter wins when both keys are set. After changing either the key or a model
+id, check it with one cheap live call:
 
 ```bash
-python -m src.main test-agents           # verify every agent works (do this first)
-python -m src.main daily                 # all enabled agents
-python -m src.main daily --agent haiku   # just one
-python -m src.main status                # per-agent counts + spend
-```
-
-### Checking the fleet
-
-After editing `agents.yaml`, verify each agent before trusting a 06:30 cron run:
-
-```bash
-python -m src.main test-agents
+python -m src.main test-llm
 ```
 
 ```
-[OK  ] haiku         1.2s  $0.00004  openrouter: anthropic/claude-haiku-4.5  +  anthropic/claude-sonnet-4.6
-[FAIL] gemini-flash  0.4s  $0.00000  openrouter: google/gemini-2.5-flashh
-        └─ RuntimeError: OpenRouter 404: No endpoints found for google/gemini-2.5-flashh
+Checking openrouter: anthropic/claude-haiku-4.5 + anthropic/claude-sonnet-4.6 — one small live call per model.
 
-1/2 agent(s) OK · check cost $0.00004
+[OK  ]   2.3s  $0.00043
 ```
 
-It makes **one small live call per model** (fractions of a cent, reported), and
-exercises exactly what the pipeline needs: a JSON-schema **structured** call on
-the filter model plus a text call on the summary model when it differs. It
-**exits non-zero** if any agent fails, so it can gate a deploy. The checks never
-touch the agent databases. Typical failures it catches: a mistyped model id, a
-model that can't do structured outputs, an expired key, or no credit.
+It exercises exactly what the pipeline needs — a JSON-schema **structured** call
+on the filter model plus a text call on the summary model — and **exits non-zero**
+on failure, so it can gate a deploy. It writes to an in-memory database, never
+the real one. Typical failures it catches: a model id that doesn't exist on this
+provider, a model that can't do structured outputs, an expired key, no credit.
 
-**No `agents.yaml` → single-agent mode**, using `data/agent.db`, `reports/`, and
-the models from `.env` — exactly as before.
+### A retired experiment
+
+Between 2026-08-10 and 2026-09-08 this agent ran **ten models in parallel** over
+one shared input stream to compare them, including a duplicate of one model used
+as a self-control. That fleet is retired; its databases and archived reports live
+under `archive/fleet-2026-08/` in the state repo, and
+`scripts/compare_agents.py` still reads them.
+
+The headline result is worth knowing before building anything stateful: the two
+agents running the **identical model and configuration** diverged from Cohen's
+kappa 1.000 (cold start, n=846) to 0.608 within four days, *directionally*
+(McNemar p=0.0038), purely because each kept its own memory store. Within four
+days an agent disagreed with its own twin more than it disagreed with several
+entirely different models.
 
 ### Cost tracking
 

@@ -162,6 +162,8 @@ CREATE TABLE IF NOT EXISTS llm_usage (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     ts                TEXT NOT NULL,
     day               TEXT NOT NULL,          -- YYYY-MM-DD (Europe/Istanbul)
+    -- Retired fleet column: kept so rows written before 2026-09 keep
+    -- their provenance. Nothing writes it any more.
     agent             TEXT NOT NULL DEFAULT '',
     model             TEXT NOT NULL,
     call_type         TEXT NOT NULL,          -- score|vet|dedupe|summary|race_results
@@ -173,7 +175,7 @@ CREATE INDEX IF NOT EXISTS idx_llm_usage_day ON llm_usage(day);
 CREATE INDEX IF NOT EXISTS idx_llm_usage_ts ON llm_usage(ts);
 
 -- Shared-run bookkeeping (used in data/shared.db): what the collect phase has
--- already downloaded, so running N agents doesn't re-fetch article bodies.
+-- already downloaded, so a re-run doesn't re-fetch article bodies.
 CREATE TABLE IF NOT EXISTS fetched_items (
     kind             TEXT NOT NULL,           -- 'feed' | 'web' | 'ig'
     key              TEXT NOT NULL,
@@ -796,29 +798,29 @@ class Store:
 
     # --- LLM cost accounting --------------------------------------------
 
-    def record_llm_usage(self, agent: str, model: str, call_type: str,
+    def record_llm_usage(self, model: str, call_type: str,
                          prompt_tokens: int = 0, completion_tokens: int = 0,
                          cost_usd: float = 0.0, day: Optional[str] = None) -> None:
         from .timeutil import istanbul_day
 
         with self.tx() as conn:
             conn.execute(
-                "INSERT INTO llm_usage(ts, day, agent, model, call_type, "
-                "prompt_tokens, completion_tokens, cost_usd) VALUES(?,?,?,?,?,?,?,?)",
-                (now_iso(), day or istanbul_day(), agent, model, call_type,
+                "INSERT INTO llm_usage(ts, day, model, call_type, "
+                "prompt_tokens, completion_tokens, cost_usd) VALUES(?,?,?,?,?,?,?)",
+                (now_iso(), day or istanbul_day(), model, call_type,
                  prompt_tokens, completion_tokens, cost_usd),
             )
 
     def cost_by_model(self, since_day: Optional[str] = None) -> list[sqlite3.Row]:
         """Per-model spend; `since_day` is 'YYYY-MM-DD'."""
-        sql = ("SELECT agent, model, COUNT(*) AS calls, "
+        sql = ("SELECT model, COUNT(*) AS calls, "
                "SUM(prompt_tokens + completion_tokens) AS tokens, "
                "SUM(cost_usd) AS cost FROM llm_usage")
         params: list = []
         if since_day:
             sql += " WHERE day >= ?"
             params.append(since_day)
-        sql += " GROUP BY agent, model ORDER BY cost DESC"
+        sql += " GROUP BY model ORDER BY cost DESC"
         return self.conn.execute(sql, params).fetchall()
 
     def _cost_agg(self, where: str, params: list) -> dict:

@@ -118,7 +118,7 @@ def _resolve_targets(args_paths: list[str]) -> list[Path]:
             else:
                 print(f"skip (not found): {p}", file=sys.stderr)
         return out
-    # reports/<YYYY>/x.md (single agent) and reports/<agent>/<YYYY>/x.md (fleet)
+    # reports/<YYYY>/x.md, plus archive/*/reports/<agent>/<YYYY>/x.md
     return sorted(set(base.glob("*/*.md")) | set(base.glob("*/*/*.md")))
 
 

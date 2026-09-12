@@ -35,7 +35,6 @@ IG_ACCOUNTS_FILE = CONFIG_DIR / "igaccounts.md"
 WEBSITES_FILE = CONFIG_DIR / "websites.md"
 INTERESTS_FILE = CONFIG_DIR / "interests.yaml"
 MEMORY_FILE = CONFIG_DIR / "memory.yaml"
-AGENTS_FILE = CONFIG_DIR / "agents.yaml"
 DB_FILE = DATA_DIR / "agent.db"                 # legacy single-agent DB
 SHARED_DB_FILE = DATA_DIR / "shared.db"        # global: SociaVault credits + fetch dedup
 LOG_FILE = LOGS_DIR / "agent.log"

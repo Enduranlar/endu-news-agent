@@ -23,15 +23,11 @@ from datetime import timedelta
 from urllib.parse import parse_qs, urlencode, urlparse
 
 from . import settings
-from .config_loader import _normalize_handle, append_ig_account, load_agents
+from .config_loader import _normalize_handle, append_ig_account
 from .feed_detect import add_website
 from .store import Store
 
 log = logging.getLogger("agent.web")
-
-
-def _agents():
-    return load_agents(env_default=("", ""))
 
 
 def _strip_www(host: str) -> str:
@@ -39,46 +35,31 @@ def _strip_www(host: str) -> str:
 
 
 def gather_suggestions() -> list[dict]:
-    """Pending suggestions across every agent, merged by (kind, key).
-
-    Different models propose different sources; show each candidate once and note
-    which agents proposed it (approving appends to the shared config file)."""
-    merged: dict = {}
-    for agent in _agents():
-        if not agent.db_path.exists():
-            continue
-        with Store(agent.db_path) as store:
-            for row in store.pending_suggestions():
-                key = (row["kind"], row["key"])
-                entry = merged.get(key)
-                if entry is None:
-                    entry = dict(row)
-                    entry["agents"] = []
-                    merged[key] = entry
-                entry["agents"].append(agent.name)
-    return sorted(merged.values(), key=lambda e: (e.get("created_at") or ""), reverse=True)
+    """Pending suggestions, newest first."""
+    if not settings.DB_FILE.exists():
+        return []
+    with Store(settings.DB_FILE) as store:
+        rows = [dict(r) for r in store.pending_suggestions()]
+    return sorted(rows, key=lambda e: (e.get("created_at") or ""), reverse=True)
 
 
 def gather_costs() -> list[dict]:
-    """Per-agent LLM spend for today / 7d / 30d."""
+    """LLM spend for today / 7d / 30d, per model."""
     from .timeutil import istanbul_now
 
+    if not settings.DB_FILE.exists():
+        return []
     now = istanbul_now()
     windows = {
         "today": now.strftime("%Y-%m-%d"),
         "d7": (now - timedelta(days=7)).strftime("%Y-%m-%d"),
         "d30": (now - timedelta(days=30)).strftime("%Y-%m-%d"),
     }
-    rows = []
-    for agent in _agents():
-        if not agent.db_path.exists():
-            continue
-        with Store(agent.db_path) as store:
-            row = {"agent": agent.name, "model": agent.model}
-            for k, d in windows.items():
-                row[k] = float(store.cost_totals(since_day=d).get("cost") or 0.0)
-            rows.append(row)
-    return rows
+    with Store(settings.DB_FILE) as store:
+        row = {}
+        for k, d in windows.items():
+            row[k] = float(store.cost_totals(since_day=d).get("cost") or 0.0)
+    return [row]
 
 
 # --- HTML rendering ----------------------------------------------------------
@@ -110,7 +91,6 @@ h2 { font-size: 15px; margin: 24px 0 10px; color: #333;
   vertical-align: middle; }
 .badge.ig { background: #c13584; }
 .badge.site, .badge.rss { background: #2563eb; }
-.badge.agent { background: #475569; font-weight: 500; }
 table.cost { width: 100%; border-collapse: collapse; font-size: 14px; }
 table.cost th, table.cost td { text-align: left; padding: 6px 4px; border-bottom: 1px solid #eee; }
 table.cost td.num, table.cost th.num { text-align: right; font-variant-numeric: tabular-nums; }
@@ -165,15 +145,12 @@ def render_page(suggestions, costs=None, message: str = "", is_error: bool = Fal
         if s["created_at"]:
             meta_bits.append(_esc(str(s["created_at"])[:10]))
         meta = " · ".join(meta_bits)
-        agent_badges = "".join(
-            f'<span class="badge agent">{_esc(a)}</span>' for a in (s.get("agents") or [])
-        )
         cards.append(
             f"""
         <div class="card">
           <div>
             <a class="title" href="{_esc(link)}" target="_blank" rel="noopener">{_esc(title)}</a>
-            <span class="badge {badge}">{_esc(badge)}</span>{agent_badges}
+            <span class="badge {badge}">{_esc(badge)}</span>
           </div>
           <div class="reason">{_esc(s['reason'])}</div>
           <div class="meta">{meta}</div>
@@ -199,24 +176,16 @@ def render_page(suggestions, costs=None, message: str = "", is_error: bool = Fal
 
     cost_rows = ""
     if costs:
-        t_today = sum(c["today"] for c in costs)
-        t_30 = sum(c["d30"] for c in costs)
-        body = "".join(
-            f"<tr><td>{_esc(c['agent'])}<div class=\"cmodel\">{_esc(c['model'])}</div></td>"
-            f"<td class=\"num\">${c['today']:.4f}</td>"
-            f"<td class=\"num\">${c['d7']:.4f}</td>"
-            f"<td class=\"num\">${c['d30']:.4f}</td></tr>"
-            for c in costs
-        )
+        c = costs[0]
         cost_rows = f"""
     <h2>Maliyet (model harcaması)</h2>
     <div class="card">
       <table class="cost">
-        <tr><th>Ajan</th><th class="num">Bugün</th><th class="num">7 gün</th>
+        <tr><th class="num">Bugün</th><th class="num">7 gün</th>
             <th class="num">30 gün</th></tr>
-        {body}
-        <tr class="tot"><td>TOPLAM</td><td class="num">${t_today:.4f}</td>
-            <td class="num"></td><td class="num">${t_30:.4f}</td></tr>
+        <tr><td class="num">${c['today']:.4f}</td>
+            <td class="num">${c['d7']:.4f}</td>
+            <td class="num">${c['d30']:.4f}</td></tr>
       </table>
     </div>"""
 
@@ -334,19 +303,13 @@ class Handler(BaseHTTPRequestHandler):
             self._redirect(f"Hata: {exc}", is_error=True)
 
     def _dispatch(self, path: str, f) -> str:
-        """Apply an action across the whole fleet.
-
-        Suggestions live in each agent's DB but feed shared config files, so a
-        decision is marked in EVERY agent's DB (no agent re-suggests it) while the
-        config file is appended once."""
+        """Approve or dismiss a suggestion, appending to the config file."""
         proxy = self.server.proxy  # type: ignore[attr-defined]
         path = urlparse(path).path
-        agents = [a for a in _agents() if a.db_path.exists()]
 
         def mark_all(kind: str, key: str, status: str) -> None:
-            for agent in agents:
-                with Store(agent.db_path) as store:
-                    store.set_suggestion_status_by_key(kind, key, status)
+            with Store(settings.DB_FILE) as store:
+                store.set_suggestion_status_by_key(kind, key, status)
 
         if path == "/dismiss":
             kind, key = f("kind"), f("key")
